@@ -739,6 +739,11 @@ static void haptic_audio_task(void *arg)
     uint8_t buffer[DS5_AUDIO_READ_BUFFER_BYTES];
 
     while (true) {
+        /* USB is installed only after the first live wireless connection. */
+        if (!tud_inited() || !tud_mounted()) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
         uint16_t available = tud_audio_available();
         while (available >= DS5_AUDIO_FRAME_BYTES(DUALSENSE_HAPTIC_AUDIO_CHANNELS)) {
             uint16_t read_len = available > sizeof(buffer) ? sizeof(buffer) : available;

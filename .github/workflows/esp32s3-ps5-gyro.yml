@@ -8,6 +8,8 @@ on:
       - 'source/final-three-in-one/firmware/esp32s3_switch2_bridge/**'
       - 'source/final-three-in-one/tools/tests/dualsense_report_mapper_test.c'
       - 'source/final-three-in-one/tools/tests/stubs/**'
+      - 'tools/tests/usb_source_presence_test.c'
+      - 'firmware/esp32s3_dualsense_identity_experiment/**'
       - '.github/workflows/esp32s3-ps5-gyro.yml'
   pull_request:
     paths:
@@ -15,6 +17,8 @@ on:
       - 'source/final-three-in-one/firmware/esp32s3_switch2_bridge/**'
       - 'source/final-three-in-one/tools/tests/dualsense_report_mapper_test.c'
       - 'source/final-three-in-one/tools/tests/stubs/**'
+      - 'tools/tests/usb_source_presence_test.c'
+      - 'firmware/esp32s3_dualsense_identity_experiment/**'
       - '.github/workflows/esp32s3-ps5-gyro.yml'
 
 permissions:
@@ -25,6 +29,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Test USB connection lifecycle in both ESP source trees
+        run: |
+          for tree in firmware source/final-three-in-one/firmware; do
+            gcc -std=c11 -Wall -Wextra -Werror \
+              -I"$tree/esp32s3_dualsense_identity_experiment/main" \
+              tools/tests/usb_source_presence_test.c -o /tmp/usb_source_presence_test
+            /tmp/usb_source_presence_test
+          done
       - name: Compile and run mapper regressions
         working-directory: source/final-three-in-one
         run: |

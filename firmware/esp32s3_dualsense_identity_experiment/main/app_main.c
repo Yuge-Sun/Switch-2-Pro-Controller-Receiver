@@ -20,6 +20,7 @@
 #include "tinyusb.h"
 #include "tusb.h"
 #include "usb_dualsense_descriptor.h"
+#include "usb_source_presence.h"
 #include "v55_control_protocol.h"
 
 #if DS5_ENABLE_UAC1_AUDIO || DS5_ENABLE_UAC2_AUDIO
@@ -99,6 +100,8 @@ static volatile bool s_usb_bus_reset_pending;
 static volatile bool s_usb_bus_reset_was_ready;
 static TaskHandle_t s_control_task_handle;
 static TaskHandle_t s_input_task_handle;
+static usb_source_presence_t s_usb_presence;
+static bool s_usb_driver_installed;
 
 #define PRO2_INPUT_STALE_US 200000LL
 #define PRO2_INPUT_WARMUP_UPDATES 4
@@ -110,7 +113,6 @@ static TaskHandle_t s_input_task_handle;
 #define DS5_HID_EMERGENCY_RECOVERY_US 8000000LL
 #define DS5_USB_REENUMERATION_GRACE_US 15000000LL
 #define DS5_USB_RECOVERY_COOLDOWN_US 10000000LL
-#define DS5_USB_RECONNECT_DELAY_MS 250
 #define DS5_USB_RECOVERY_INHIBIT_LOG_US 1000000LL
 #define V55_CONTROL_LINE_MAX 192
 
@@ -586,9 +588,72 @@ static bool usb_hid_recovery_allowed(int64_t now_us, bool emergency)
     return true;
 }
 
+/* Keep BLE, pairing storage and UART management alive while USB is absent.
+ * Only the input task changes the physical USB attachment state.
+ */
+static void detach_source_usb(int64_t now_us)
+{
+    usb_source_presence_detached(&s_usb_presence, now_us);
+    (void)tud_disconnect();
+#if DS5_ENABLE_UAC1_AUDIO || DS5_ENABLE_UAC2_AUDIO
+    dualsense_haptic_audio_set_streaming(false, 0);
+#endif
+    s_mounted = false;
+    s_suspended = false;
+    s_usb_configuration_ready = false;
+    s_usb_bus_reset_pending = false;
+    s_usb_bus_reset_was_ready = false;
+    s_hid_endpoint_kick_pending = false;
+    s_hid_endpoint_kicks_since_report = 0;
+    s_report_submit_failure_streak = 0;
+    s_first_report_submit_failure_us = 0;
+    s_last_report_us = 0;
+}
+
+static void update_source_usb(bool connected, bool warmed_up,
+                              bool live, int64_t age_us, int64_t now_us)
+{
+    bool wanted = usb_source_presence_wanted(&s_usb_presence, connected,
+                                             warmed_up, live, age_us, now_us);
+    if (wanted == s_usb_presence.attached) {
+        return;
+    }
+    if (!wanted) {
+        detach_source_usb(now_us);
+        ESP_LOGI(TAG, "[DS5_USB_PRESENCE] attached=false reason=%s",
+                 connected ? "input_timeout" : "ble_disconnected");
+        return;
+    }
+
+    /* Discard any late bus events from the previous USB session. */
+    s_mounted = false;
+    s_suspended = false;
+    s_usb_configuration_ready = false;
+    if (!s_usb_driver_installed) {
+        /* Installing TinyUSB connects the pull-up. Defer the entire install
+         * to avoid enumerating even briefly with no controller at boot.
+         */
+        const tinyusb_config_t tusb_config = {
+            .device_descriptor = dualsense_usb_device_descriptor(),
+            .string_descriptor = dualsense_usb_string_descriptors(),
+            .string_descriptor_count = dualsense_usb_string_descriptor_count(),
+            .external_phy = false,
+            .configuration_descriptor = dualsense_usb_configuration_descriptor(),
+            .self_powered = false,
+            .vbus_monitor_io = 0,
+        };
+        ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_config));
+        s_usb_driver_installed = true;
+    } else {
+        (void)tud_connect();
+    }
+    s_usb_presence.attached = true;
+    ESP_LOGI(TAG, "[DS5_USB_PRESENCE] attached=true reason=live_controller");
+}
+
 static void recover_stalled_usb_hid(int64_t now_us)
 {
-    if (s_usb_recovering) {
+    if (s_usb_recovering || !s_usb_presence.attached) {
         return;
     }
     int64_t report_age_us = s_last_report_us > 0
@@ -618,20 +683,10 @@ static void recover_stalled_usb_hid(int64_t now_us)
              (unsigned long)s_hid_endpoint_kicks_since_report,
              (unsigned long)s_usb_recovery_count);
 
-#if DS5_ENABLE_UAC1_AUDIO || DS5_ENABLE_UAC2_AUDIO
-    dualsense_haptic_audio_set_streaming(false, 0);
-#endif
-    s_mounted = false;
-    s_suspended = false;
-    s_usb_configuration_ready = false;
-    s_hid_endpoint_kick_pending = false;
-    s_hid_endpoint_kicks_since_report = 0;
-    s_report_submit_failure_streak = 0;
-    s_first_report_submit_failure_us = 0;
-    (void)tud_disconnect();
-    vTaskDelay(pdMS_TO_TICKS(DS5_USB_RECONNECT_DELAY_MS));
-    s_last_report_us = 0;
-    (void)tud_connect();
+    detach_source_usb(now_us);
+    /* The input loop rechecks the source after the minimum detach interval.
+     * Recovery must never reconnect USB after the controller has gone away.
+     */
     s_usb_recovering = false;
 }
 
@@ -688,6 +743,7 @@ static void neutral_report_task(void *arg)
             }
         }
         bool using_pro2 = live_recent && stable_update_count >= PRO2_INPUT_WARMUP_UPDATES;
+        update_source_usb(connected, using_pro2, live, age_us, now_us);
         dualsense_input_debug_t debug;
 
         if (connected != last_connected) {
@@ -705,7 +761,7 @@ static void neutral_report_task(void *arg)
             memset(&debug, 0, sizeof(debug));
         }
 
-        if (s_mounted && s_usb_configuration_ready &&
+        if (s_usb_presence.attached && s_mounted && s_usb_configuration_ready &&
             !s_suspended && !s_usb_recovering &&
             !s_hid_endpoint_kick_pending &&
             tud_hid_n_ready(0)) {
@@ -740,7 +796,7 @@ static void neutral_report_task(void *arg)
                     next_wake = xTaskGetTickCount();
                 }
             }
-        } else if (s_mounted && s_usb_configuration_ready &&
+        } else if (s_usb_presence.attached && s_mounted && s_usb_configuration_ready &&
                    !s_suspended && !s_usb_recovering &&
                    !s_hid_endpoint_kick_pending) {
             s_report_not_ready_count++;
@@ -835,20 +891,10 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(nvs_err);
 
-    const tinyusb_config_t tusb_config = {
-        .device_descriptor = dualsense_usb_device_descriptor(),
-        .string_descriptor = dualsense_usb_string_descriptors(),
-        .string_descriptor_count = dualsense_usb_string_descriptor_count(),
-        .external_phy = false,
-        .configuration_descriptor = dualsense_usb_configuration_descriptor(),
-        .self_powered = false,
-        .vbus_monitor_io = 0,
-    };
-
 #if DS5_ENABLE_UAC1_AUDIO || DS5_ENABLE_UAC2_AUDIO
     dualsense_haptic_audio_init();
 #endif
-    ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_config));
+    ESP_LOGI(TAG, "[DS5_USB_PRESENCE] attached=false waiting_for=live_controller");
     pro2_input_backend_init();
     pro2_rumble_backend_init();
     v55_control_protocol_init();
