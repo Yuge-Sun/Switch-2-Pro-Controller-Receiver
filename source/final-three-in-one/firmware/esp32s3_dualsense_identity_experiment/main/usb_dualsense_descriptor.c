@@ -416,7 +416,7 @@ static const char *s_ds5_string_descriptors[] = {
 #if DS5_ENABLE_USB_AUDIO
     "Wireless Controller Audio",
 #endif
-    "Wireless Controller",
+    DS5_USB_PRODUCT,
 };
 
 _Static_assert(sizeof(s_ds5_configuration_descriptor) == DS5_CONFIG_TOTAL_LEN,
