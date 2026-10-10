@@ -25,8 +25,21 @@
 #include "switch2_state.h"
 #include "ble_dual_probe.h"
 #include "ble_central.h"
+#include "ble_idle_wake.h"
+#include "freertos/portmacro.h"
 
 static const char *TAG = "ble";
+static portMUX_TYPE s_idle_wake_lock = portMUX_INITIALIZER_UNLOCKED;
+static ble_idle_wake_t s_idle_wake;
+static ble_addr_t s_idle_peer;
+
+static bool idle_wake_blocked(void)
+{
+    portENTER_CRITICAL(&s_idle_wake_lock);
+    bool blocked = s_idle_wake.blocked;
+    portEXIT_CRITICAL(&s_idle_wake_lock);
+    return blocked;
+}
 
 #define BLE_SCAN_DURATION_MS 15000
 #define BLE_CONNECT_TIMEOUT_MS 30000
@@ -1213,6 +1226,21 @@ static void select_auto_scan_target(const struct ble_gap_disc_desc *disc,
 
 static void log_adv_report(const struct ble_gap_disc_desc *disc)
 {
+    /* Observe every advertisement, before parsing/caching. Duplicate filtering
+     * is disabled for this scan so an awake peer cannot look like a quiet one.
+     */
+    portENTER_CRITICAL(&s_idle_wake_lock);
+    bool was_blocked = s_idle_wake.blocked;
+    bool allowed = ble_idle_wake_advertisement(
+        &s_idle_wake, same_addr_value(&disc->addr, &s_idle_peer),
+        esp_timer_get_time());
+    portEXIT_CRITICAL(&s_idle_wake_lock);
+    if (!allowed) {
+        return;
+    }
+    if (was_blocked) {
+        APP_LOGI(TAG, "[PRO2_IDLE] wake_advertisement=true reconnect_allowed=true");
+    }
     char addr[32];
     format_addr(&disc->addr, addr, sizeof(addr));
     uint32_t index = ++s_scan_seen_count;
@@ -2177,6 +2205,9 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_DISC_COMPLETE:
         {
+        portENTER_CRITICAL(&s_idle_wake_lock);
+        s_idle_wake.observing = false;
+        portEXIT_CRITICAL(&s_idle_wake_lock);
         bool auto_scan = s_auto_scan_connect;
         s_conn_metrics.scan_complete_count++;
         s_conn_metrics.last_scan_complete_reason = event->disc_complete.reason;
@@ -2395,6 +2426,10 @@ void ble_central_init(void)
 
 static esp_err_t ble_central_connect_addr(const ble_addr_t *target, const char *label)
 {
+    if (idle_wake_blocked()) {
+        APP_LOGI(TAG, "[PRO2_IDLE] connect_blocked=true waiting_for=controller_wake");
+        return ESP_ERR_INVALID_STATE;
+    }
     if (!target) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -2475,6 +2510,20 @@ static esp_err_t ble_central_start_scan_internal(bool auto_connect,
     disc_params.window = 0;
     disc_params.filter_policy = 0;
     disc_params.limited = 0;
+    if (idle_wake_blocked()) {
+        /* Keep listening continuously until the disconnected peer wakes.
+         * A normal intermittent scan could mistake radio downtime for sleep.
+         */
+        if (auto_connect) {
+            duration_ms = BLE_HS_FOREVER;
+        }
+        disc_params.filter_duplicates = 0;
+        disc_params.itvl = 0x30;
+        disc_params.window = 0x30;
+        portENTER_CRITICAL(&s_idle_wake_lock);
+        ble_idle_wake_scan_started(&s_idle_wake, esp_timer_get_time());
+        portEXIT_CRITICAL(&s_idle_wake_lock);
+    }
 
     s_scan_seen_count = 0;
     memset(s_scan_cache, 0, sizeof(s_scan_cache));
@@ -2493,6 +2542,9 @@ static esp_err_t ble_central_start_scan_internal(bool auto_connect,
     int rc = ble_gap_disc(s_own_addr_type, duration_ms, &disc_params, ble_gap_event, NULL);
     s_conn_metrics.last_scan_start_rc = rc;
     if (rc != 0) {
+        portENTER_CRITICAL(&s_idle_wake_lock);
+        s_idle_wake.observing = false;
+        portEXIT_CRITICAL(&s_idle_wake_lock);
         s_state = BLE_STATE_IDLE;
         s_auto_scan_connect = false;
         s_auto_scan_target_valid = false;
@@ -2578,6 +2630,33 @@ void ble_central_start_auto_reconnect(void)
         return;
     }
     schedule_auto_reconnect("control", 0);
+}
+
+esp_err_t ble_central_disconnect_until_wake(void)
+{
+    if (!s_connected || s_state != BLE_STATE_CONNECTED) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    struct ble_gap_conn_desc desc;
+    if (ble_gap_conn_find(s_conn_handle, &desc) != 0) {
+        return ESP_FAIL;
+    }
+    portENTER_CRITICAL(&s_idle_wake_lock);
+    s_idle_peer = desc.peer_ota_addr;
+    s_idle_wake = (ble_idle_wake_t){.blocked = true};
+    portEXIT_CRITICAL(&s_idle_wake_lock);
+    /* Keep normal reconnection scheduling: scans are gated until a new wake. */
+    s_suppress_next_auto_reconnect = false;
+    int rc = ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    if (rc != 0) {
+        portENTER_CRITICAL(&s_idle_wake_lock);
+        s_idle_wake = (ble_idle_wake_t){0};
+        portEXIT_CRITICAL(&s_idle_wake_lock);
+        APP_LOGW(TAG, "[PRO2_IDLE] disconnect_failed rc=%d", rc);
+        return ESP_FAIL;
+    }
+    APP_LOGI(TAG, "[PRO2_IDLE] disconnect_requested=true waiting_for=controller_wake");
+    return ESP_OK;
 }
 
 void ble_central_disconnect(void)

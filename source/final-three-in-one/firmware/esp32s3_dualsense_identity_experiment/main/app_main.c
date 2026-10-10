@@ -16,6 +16,8 @@
 #include "freertos/task.h"
 #include "nvs_flash.h"
 #include "pro2_input_backend.h"
+#include "pro2_inactivity.h"
+#include "ble_central.h"
 #include "pro2_rumble_backend.h"
 #include "tinyusb.h"
 #include "tusb.h"
@@ -727,6 +729,9 @@ static void neutral_report_task(void *arg)
     uint8_t report[DUALSENSE_INPUT_PAYLOAD_SIZE];
     int64_t next_input_log_us = 0;
     bool last_connected = false;
+    pro2_inactivity_t inactivity = {0};
+    bool idle_disconnect_pending = false;
+    int64_t next_idle_disconnect_attempt_us = 0;
     uint32_t stable_update_count = 0;
     uint32_t last_seen_updates = 0;
     uint32_t last_mapped_updates = 0;
@@ -743,6 +748,15 @@ static void neutral_report_task(void *arg)
         int64_t age_us = INT64_MAX;
         bool live = pro2_input_backend_get_live(&state, &updates, &age_us);
         bool connected = strcmp(pro2_input_backend_state(), "connected") == 0;
+        if (!connected) {
+            inactivity = (pro2_inactivity_t){0};
+            idle_disconnect_pending = false;
+            next_idle_disconnect_attempt_us = 0;
+        }
+        /* A successful terminate request completes asynchronously. Keep USB
+         * absent and do not resubmit the request while waiting for that event.
+         */
+        connected = connected && !idle_disconnect_pending;
         bool live_recent = live && connected && age_us <= PRO2_INPUT_STALE_US;
         if (!live_recent) {
             stable_update_count = 0;
@@ -754,6 +768,19 @@ static void neutral_report_task(void *arg)
             }
         }
         bool using_pro2 = live_recent && stable_update_count >= PRO2_INPUT_WARMUP_UPDATES;
+        if (using_pro2 &&
+            pro2_inactivity_update(&inactivity, &state, now_us) &&
+            now_us >= next_idle_disconnect_attempt_us) {
+            esp_err_t err = ble_central_disconnect_until_wake();
+            next_idle_disconnect_attempt_us = now_us + 1000000LL;
+            if (err == ESP_OK) {
+                idle_disconnect_pending = true;
+                connected = false;
+                using_pro2 = false;
+                stable_update_count = 0;
+                ESP_LOGI(TAG, "[PRO2_IDLE] timeout_minutes=10 gyro_ignored=true");
+            }
+        }
         update_source_usb(connected, using_pro2, live, age_us, now_us);
         if (!s_usb_presence.attached) {
             source_report_latched = false;

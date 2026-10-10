@@ -9,6 +9,9 @@ on:
       - 'source/final-three-in-one/tools/tests/dualsense_report_mapper_test.c'
       - 'source/final-three-in-one/tools/tests/stubs/**'
       - 'tools/tests/usb_source_presence_test.c'
+      - 'tools/tests/pro2_inactivity_test.c'
+      - 'tools/tests/run_usb_source_presence_tests.ps1'
+      - 'firmware/esp32s3_switch2_bridge/main/ble/**'
       - 'firmware/esp32s3_dualsense_identity_experiment/**'
       - '.github/workflows/esp32s3-ps5-gyro.yml'
   pull_request:
@@ -18,6 +21,9 @@ on:
       - 'source/final-three-in-one/tools/tests/dualsense_report_mapper_test.c'
       - 'source/final-three-in-one/tools/tests/stubs/**'
       - 'tools/tests/usb_source_presence_test.c'
+      - 'tools/tests/pro2_inactivity_test.c'
+      - 'tools/tests/run_usb_source_presence_tests.ps1'
+      - 'firmware/esp32s3_switch2_bridge/main/ble/**'
       - 'firmware/esp32s3_dualsense_identity_experiment/**'
       - '.github/workflows/esp32s3-ps5-gyro.yml'
 
@@ -36,6 +42,12 @@ jobs:
               -I"$tree/esp32s3_dualsense_identity_experiment/main" \
               tools/tests/usb_source_presence_test.c -o /tmp/usb_source_presence_test
             /tmp/usb_source_presence_test
+            gcc -std=c11 -Wall -Wextra -Werror \
+              -I"$tree/esp32s3_dualsense_identity_experiment/main" \
+              -I"$tree/esp32s3_switch2_bridge/main/bridge" \
+              -I"$tree/esp32s3_switch2_bridge/main/ble" \
+              tools/tests/pro2_inactivity_test.c -o /tmp/pro2_inactivity_test
+            /tmp/pro2_inactivity_test
           done
       - name: Compile and run mapper regressions
         working-directory: source/final-three-in-one

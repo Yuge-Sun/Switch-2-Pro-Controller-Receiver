@@ -14,4 +14,11 @@ foreach ($tree in @("firmware", "source/final-three-in-one/firmware")) {
     if ($LASTEXITCODE -ne 0) { throw "USB source presence compilation failed: $tree" }
     & $exe
     if ($LASTEXITCODE -ne 0) { throw "USB source presence tests failed: $tree" }
+    $bridge = Join-Path $repoRoot "$tree/esp32s3_switch2_bridge/main/bridge"
+    $ble = Join-Path $repoRoot "$tree/esp32s3_switch2_bridge/main/ble"
+    $idleExe = Join-Path $buildDir "pro2_inactivity_test.exe"
+    & $Compiler @prefix -std=c11 -Wall -Wextra -Werror "-I$include" "-I$bridge" "-I$ble" (Join-Path $PSScriptRoot "pro2_inactivity_test.c") -o $idleExe
+    if ($LASTEXITCODE -ne 0) { throw "Pro2 inactivity compilation failed: $tree" }
+    & $idleExe
+    if ($LASTEXITCODE -ne 0) { throw "Pro2 inactivity tests failed: $tree" }
 }
