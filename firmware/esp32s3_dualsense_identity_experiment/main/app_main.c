@@ -17,6 +17,10 @@
 #include "nvs_flash.h"
 #include "pro2_input_backend.h"
 #include "pro2_inactivity.h"
+
+#ifndef PRO2_PAIRING_DIAGNOSTICS
+#define PRO2_PAIRING_DIAGNOSTICS 0
+#endif
 #include "ble_central.h"
 #include "pro2_rumble_backend.h"
 #include "tinyusb.h"
@@ -757,7 +761,7 @@ static void neutral_report_task(void *arg)
             }
         }
         bool using_pro2 = live_recent && stable_update_count >= PRO2_INPUT_WARMUP_UPDATES;
-        if (using_pro2 &&
+        if (!PRO2_PAIRING_DIAGNOSTICS && using_pro2 &&
             pro2_inactivity_update(&inactivity, &state, now_us) &&
             now_us >= next_idle_disconnect_attempt_us) {
             esp_err_t err = ble_central_disconnect_until_wake();
@@ -888,6 +892,9 @@ static void neutral_report_task(void *arg)
 
 void app_main(void)
 {
+#if PRO2_PAIRING_DIAGNOSTICS
+    ESP_LOGI(TAG, "[PAIR_DIAG] version=2 inactivity_timeout=disabled pairing_sequence=complete");
+#endif
     ESP_LOGI(TAG, "[DS5_IDENTITY] enabled=true mode=dualsense_experimental profile=%s",
              DS5_PROFILE_NAME);
     ESP_LOGI(TAG,

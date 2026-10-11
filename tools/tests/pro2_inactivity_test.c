@@ -16,7 +16,7 @@ static void test_timeout_and_motion(void)
     switch2_state_t state = neutral();
     assert(!pro2_inactivity_update(&timer, &state, 0));
     /* Live, changing motion must not restart the clock. */
-    for (int second = 1; second < 600; ++second) {
+    for (int second = 1; second < PRO2_INACTIVITY_TIMEOUT_US / 1000000LL; ++second) {
         state.motion_valid = true;
         memset(state.motion, second & 255, sizeof(state.motion));
         state.lx = 2048 + (second % 161);
@@ -35,12 +35,12 @@ static void test_controls(void)
         switch2_state_t state = neutral();
         assert(!pro2_inactivity_update(&timer, &state, 0));
         state.buttons = 1u << button;
-        assert(!pro2_inactivity_update(&timer, &state, 599000000LL));
+        assert(!pro2_inactivity_update(&timer, &state, PRO2_INACTIVITY_TIMEOUT_US - 1000000LL));
         /* A held button, including digital triggers, remains active. */
         assert(!pro2_inactivity_update(&timer, &state, 1300000000LL));
         state.buttons = 0;
-        assert(!pro2_inactivity_update(&timer, &state, 1899999999LL));
-        assert(pro2_inactivity_update(&timer, &state, 1900000000LL));
+        assert(!pro2_inactivity_update(&timer, &state, 1300000000LL + PRO2_INACTIVITY_TIMEOUT_US - 1));
+        assert(pro2_inactivity_update(&timer, &state, 1300000000LL + PRO2_INACTIVITY_TIMEOUT_US));
     }
     switch2_state_t state = neutral();
     uint16_t *axes[] = {&state.lx, &state.ly, &state.rx, &state.ry};
@@ -66,36 +66,33 @@ static void test_controls(void)
 
 static void test_disconnect_and_wake(void)
 {
-    ble_idle_wake_t gate = {.blocked = true};
-    usb_source_presence_t usb = {.attached = true};
+    ble_idle_wake_t gate = {0};
+    ble_idle_wake_arm(&gate);
     assert(!ble_idle_wake_advertisement(&gate, true, 600000000LL));
-    ble_idle_wake_scan_started(&gate, 600000000LL);
-    /* Persistent advertising after termination must not auto-reconnect. */
-    for (int second = 600; second < 1200; ++second) {
-        assert(!ble_idle_wake_advertisement(&gate, true, second * 1000000LL));
+    ble_idle_wake_disconnected(&gate, 600000000LL);
+    /* Even continuous advertisements cannot move the absolute deadline. */
+    for (int ms = 0; ms < 1000; ++ms) {
+        assert(!ble_idle_wake_advertisement(&gate, true, 600000000LL + ms * 1000LL));
     }
-    assert(!usb_source_presence_wanted(&usb, false, false, true, 0, 1200000000LL));
-    usb_source_presence_detached(&usb, 1200000000LL);
-    assert(!ble_idle_wake_advertisement(&gate, false, 1300000000LL));
-    /* Turning off, then on after a quiet period, permits the saved peer. */
-    assert(ble_idle_wake_advertisement(&gate, true, 1300000000LL));
+    assert(!ble_idle_wake_advertisement(&gate, true, 600999999LL));
+    assert(!ble_idle_wake_advertisement(&gate, false, 601000000LL));
+    assert(ble_idle_wake_advertisement(&gate, true, 601000000LL));
     assert(!gate.blocked);
-    assert(!usb_source_presence_wanted(&usb, true, false, false, INT64_MAX, 1300000000LL));
-    assert(usb_source_presence_wanted(&usb, true, true, true, 0, 1300000000LL));
-    pro2_inactivity_t new_connection = {0};
+    /* Delayed scanning does not start another waiting period. */
+    ble_idle_wake_arm(&gate);
+    ble_idle_wake_disconnected(&gate, 700000000LL);
+    ble_idle_wake_disconnected(&gate, 700500000LL);
+    assert(ble_idle_wake_advertisement(&gate, true, 710000000LL));
+    usb_source_presence_t usb = {.attached = true};
+    assert(!usb_source_presence_wanted(&usb, false, false, true, 0, 700000000LL));
+    usb_source_presence_detached(&usb, 700000000LL);
+    assert(!usb_source_presence_wanted(&usb, true, false, false, INT64_MAX, 710000000LL));
+    assert(usb_source_presence_wanted(&usb, true, true, true, 0, 710000000LL));
+    pro2_inactivity_t timer = {0};
     switch2_state_t state = neutral();
-    assert(!pro2_inactivity_update(&new_connection, &state, 1300000000LL));
-    assert(!pro2_inactivity_update(&new_connection, &state, 1899999999LL));
-    assert(pro2_inactivity_update(&new_connection, &state, 1900000000LL));
-
-    gate = (ble_idle_wake_t){.blocked = true};
-    ble_idle_wake_scan_started(&gate, 0);
-    assert(!ble_idle_wake_advertisement(&gate, true, BLE_IDLE_WAKE_QUIET_US - 1));
-    gate.observing = false; /* Scan interrupted, e.g. by UART management. */
-    assert(!ble_idle_wake_advertisement(&gate, true, 100000000LL));
-    ble_idle_wake_scan_started(&gate, 100000000LL);
-    assert(!ble_idle_wake_advertisement(&gate, true, 100000000LL));
-    assert(ble_idle_wake_advertisement(&gate, true, 100000000LL + BLE_IDLE_WAKE_QUIET_US));
+    assert(!pro2_inactivity_update(&timer, &state, 710000000LL));
+    assert(!pro2_inactivity_update(&timer, &state, 710000000LL + PRO2_INACTIVITY_TIMEOUT_US - 1));
+    assert(pro2_inactivity_update(&timer, &state, 710000000LL + PRO2_INACTIVITY_TIMEOUT_US));
 }
 
 int main(void)

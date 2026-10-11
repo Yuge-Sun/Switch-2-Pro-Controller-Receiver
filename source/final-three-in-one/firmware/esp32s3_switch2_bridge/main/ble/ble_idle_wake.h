@@ -2,22 +2,25 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define BLE_IDLE_WAKE_QUIET_US 5000000LL
+#define BLE_IDLE_WAKE_DELAY_US 1000000LL
 
 typedef struct {
     bool blocked;
-    bool observing;
-    int64_t last_seen_us;
+    int64_t resume_after_us;
 } ble_idle_wake_t;
 
-/* A fresh continuous scan must observe silence itself. Time with the radio
- * stopped (or duplicate filtering enabled) is not evidence of controller sleep.
- * Callers serialize this policy across the input task and NimBLE callbacks.
- */
-static inline void ble_idle_wake_scan_started(ble_idle_wake_t *gate, int64_t now_us)
+/* Arm before requesting termination. Start the absolute clock only when the
+ * disconnect event arrives. Callers serialize access across tasks. */
+static inline void ble_idle_wake_arm(ble_idle_wake_t *gate)
 {
-    gate->observing = true;
-    gate->last_seen_us = now_us;
+    *gate = (ble_idle_wake_t){.blocked = true, .resume_after_us = INT64_MAX};
+}
+
+static inline void ble_idle_wake_disconnected(ble_idle_wake_t *gate, int64_t now_us)
+{
+    if (gate->blocked && gate->resume_after_us == INT64_MAX) {
+        gate->resume_after_us = now_us + BLE_IDLE_WAKE_DELAY_US;
+    }
 }
 
 static inline bool ble_idle_wake_advertisement(ble_idle_wake_t *gate,
@@ -26,14 +29,9 @@ static inline bool ble_idle_wake_advertisement(ble_idle_wake_t *gate,
     if (!gate->blocked) {
         return true;
     }
-    if (!same_peer || !gate->observing) {
+    if (!same_peer || now_us < gate->resume_after_us) {
         return false;
     }
-    bool woke = now_us - gate->last_seen_us >= BLE_IDLE_WAKE_QUIET_US;
-    gate->last_seen_us = now_us;
-    if (woke) {
-        gate->blocked = false;
-    }
-    return woke;
+    gate->blocked = false;
+    return true;
 }
-

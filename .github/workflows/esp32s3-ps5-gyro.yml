@@ -10,6 +10,10 @@ on:
       - 'source/final-three-in-one/tools/tests/stubs/**'
       - 'tools/tests/usb_source_presence_test.c'
       - 'tools/tests/pro2_inactivity_test.c'
+      - 'tools/tests/switch2_pairing_test.c'
+      - 'tools/tests/pairing_mbedtls_config.h'
+      - 'tools/tests/run_switch2_pairing_tests.sh'
+      - 'tools/tests/run_switch2_pairing_tests.ps1'
       - 'tools/tests/run_usb_source_presence_tests.ps1'
       - 'firmware/esp32s3_switch2_bridge/main/ble/**'
       - 'firmware/esp32s3_dualsense_identity_experiment/**'
@@ -22,6 +26,10 @@ on:
       - 'source/final-three-in-one/tools/tests/stubs/**'
       - 'tools/tests/usb_source_presence_test.c'
       - 'tools/tests/pro2_inactivity_test.c'
+      - 'tools/tests/switch2_pairing_test.c'
+      - 'tools/tests/pairing_mbedtls_config.h'
+      - 'tools/tests/run_switch2_pairing_tests.sh'
+      - 'tools/tests/run_switch2_pairing_tests.ps1'
       - 'tools/tests/run_usb_source_presence_tests.ps1'
       - 'firmware/esp32s3_switch2_bridge/main/ble/**'
       - 'firmware/esp32s3_dualsense_identity_experiment/**'
@@ -70,6 +78,9 @@ jobs:
     container: espressif/idf:v5.4.2
     steps:
       - uses: actions/checkout@v4
+      - name: Test complete pairing exchange in both source trees
+        shell: bash
+        run: bash tools/tests/run_switch2_pairing_tests.sh
       - name: Build standard PS5 firmware for 16 MB ESP32-S3
         working-directory: source/final-three-in-one/firmware/esp32s3_dualsense_identity_experiment
         shell: bash

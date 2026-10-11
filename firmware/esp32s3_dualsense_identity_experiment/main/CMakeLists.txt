@@ -176,3 +176,8 @@ if(tinyusb_lib)
         DS5_INTERFACE_COUNT=${DS5_INTERFACE_COUNT}
     )
 endif()
+
+# Opt-in logging build; normal firmware retains its inactivity timer.
+if(PRO2_PAIRING_DIAGNOSTICS)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE PRO2_PAIRING_DIAGNOSTICS=1)
+endif()

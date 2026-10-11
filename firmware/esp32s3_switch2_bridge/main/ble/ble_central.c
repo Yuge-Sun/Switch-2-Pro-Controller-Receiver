@@ -25,7 +25,14 @@
 #include "switch2_state.h"
 #include "ble_central.h"
 #include "ble_idle_wake.h"
+#include "switch2_pairing.h"
+#include "esp_random.h"
+#include "mbedtls/platform_util.h"
 #include "freertos/portmacro.h"
+
+#ifndef PRO2_PAIRING_DIAGNOSTICS
+#define PRO2_PAIRING_DIAGNOSTICS 0
+#endif
 
 static const char *TAG = "ble";
 static portMUX_TYPE s_idle_wake_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -77,6 +84,9 @@ typedef struct {
     char name[32];
     bool candidate;
     int8_t rssi;
+    bool pairing_mode;
+    bool pairing_ad_known;
+    int64_t seen_us;
 } scanned_device_t;
 
 typedef struct {
@@ -133,6 +143,10 @@ static bool s_cmd_write_no_rsp;
 static bool s_init_started;
 static bool s_init_done;
 static size_t s_init_index;
+static switch2_pairing_t s_pairing;
+static struct ble_npl_callout s_pairing_timeout;
+static bool s_pairing_timer_ready;
+static int64_t s_pairing_deadline_us;
 static uint16_t s_rumble_val_handle;
 static bool s_rumble_write_no_rsp;
 static bool s_auto_scan_connect;
@@ -275,7 +289,7 @@ static void handle_auto_reconnect_after_drop(const char *reason)
 static const uint8_t s_init_cmd_0[] = {0x03, 0x91, 0x01, 0x0d, 0x00, 0x08, 0x00, 0x00, 0x01, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 static const uint8_t s_init_cmd_1[] = {0x07, 0x91, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00};
 static const uint8_t s_init_cmd_2[] = {0x16, 0x91, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00};
-static const uint8_t s_init_cmd_3[] = {0x15, 0x91, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00};
+/* Index 3 is the dynamic, validated pairing exchange (or reconnect skip). */
 static const uint8_t s_init_cmd_4[] = {0x0c, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00};
 static const uint8_t s_init_cmd_5[] = {0x11, 0x91, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00};
 static const uint8_t s_init_cmd_6[] = {0x0a, 0x91, 0x01, 0x08, 0x00, 0x14, 0x00, 0x00, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x35, 0x00, 0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
@@ -292,7 +306,7 @@ static const switch2_init_command_t s_init_commands[SWITCH2_INIT_COMMAND_COUNT] 
     {"INIT", s_init_cmd_0, sizeof(s_init_cmd_0)},
     {"CMD_07", s_init_cmd_1, sizeof(s_init_cmd_1)},
     {"CMD_16", s_init_cmd_2, sizeof(s_init_cmd_2)},
-    {"CMD_15_03", s_init_cmd_3, sizeof(s_init_cmd_3)},
+    {"PAIRING_EXCHANGE", NULL, 0},
     {"FEATSEL_SET_MASK", s_init_cmd_4, sizeof(s_init_cmd_4)},
     {"CMD_11", s_init_cmd_5, sizeof(s_init_cmd_5)},
     {"VIBRATE_CFG", s_init_cmd_6, sizeof(s_init_cmd_6)},
@@ -614,6 +628,11 @@ static bool is_rumble_uuid(const char *uuid)
 
 static void clear_gatt_cache(void)
 {
+    if (s_pairing_timer_ready) {
+        ble_npl_callout_stop(&s_pairing_timeout);
+    }
+    switch2_pairing_clear(&s_pairing);
+    s_pairing_deadline_us = 0;
     memset(s_services, 0, sizeof(s_services));
     memset(s_chars, 0, sizeof(s_chars));
     s_service_count = 0;
@@ -714,8 +733,8 @@ static void select_auto_scan_target(const struct ble_gap_disc_desc *disc,
 
 static void log_adv_report(const struct ble_gap_disc_desc *disc)
 {
-    /* Observe every advertisement, before parsing/caching. Duplicate filtering
-     * is disabled for this scan so an awake peer cannot look like a quiet one.
+    /* Check the absolute reconnect deadline before parsing/caching. Repeated
+     * advertisements never extend this delay.
      */
     portENTER_CRITICAL(&s_idle_wake_lock);
     bool was_blocked = s_idle_wake.blocked;
@@ -727,7 +746,7 @@ static void log_adv_report(const struct ble_gap_disc_desc *disc)
         return;
     }
     if (was_blocked) {
-        APP_LOGI(TAG, "[PRO2_IDLE] wake_advertisement=true reconnect_allowed=true");
+        APP_LOGI(TAG, "[PRO2_IDLE] cooldown_elapsed=true reconnect_allowed=true");
     }
     char addr[32];
     format_addr(&disc->addr, addr, sizeof(addr));
@@ -756,6 +775,12 @@ static void log_adv_report(const struct ble_gap_disc_desc *disc)
                      (name_looks_like_switch_controller(name) || nintendo_mfg);
 
     remember_scanned_device(index, &disc->addr, name, candidate, disc->rssi);
+    s_scan_cache[(index - 1) % BLE_SCAN_CACHE_MAX].pairing_ad_known =
+        adv_event_connectable(disc->event_type) && nintendo_mfg && fields.mfg_data_len >= 18;
+    s_scan_cache[(index - 1) % BLE_SCAN_CACHE_MAX].pairing_mode =
+        adv_event_connectable(disc->event_type) &&
+        switch2_pairing_advertisement(fields.mfg_data, fields.mfg_data_len);
+    s_scan_cache[(index - 1) % BLE_SCAN_CACHE_MAX].seen_us = esp_timer_get_time();
     bool preferred_match = s_auto_scan_connect &&
         s_auto_scan_preferred_valid &&
         same_addr_value(&disc->addr, &s_auto_scan_preferred);
@@ -777,6 +802,26 @@ static void log_adv_report(const struct ble_gap_disc_desc *disc)
     }
 
     if (candidate || preferred_match) {
+#if PRO2_PAIRING_DIAGNOSTICS
+        /* Legacy advertising contains at most 31 bytes. Keep an explicit cap
+         * so malformed or extended data cannot overrun the diagnostic buffer. */
+        char full_mfg[3 * 31 + 1];
+        size_t shown = fields.mfg_data_len < 31 ? fields.mfg_data_len : 31;
+        format_hex_full(fields.mfg_data, shown, full_mfg, sizeof(full_mfg));
+        APP_LOGI(TAG, "[PAIR_DIAG] adv controller=%s mfg_len=%u shown=%u mfg=\"%s\"",
+                 addr, fields.mfg_data_len, (unsigned)shown, full_mfg);
+        if (nintendo_mfg && fields.mfg_data_len >= 18) {
+            ble_addr_t local = {.type = s_own_addr_type};
+            int local_rc = ble_hs_id_copy_addr(s_own_addr_type, local.val, NULL);
+            const uint8_t *host = fields.mfg_data + 12;
+            const uint8_t zero[6] = {0};
+            const char *match = local_rc != 0 ? "unknown" :
+                memcmp(host, zero, 6) == 0 ? "zero" :
+                memcmp(host, local.val, 6) == 0 ? "yes" : "no";
+            APP_LOGI(TAG, "[PAIR_DIAG] advertised_host=%02x:%02x:%02x:%02x:%02x:%02x matches_receiver=%s local_rc=%d",
+                     host[5], host[4], host[3], host[2], host[1], host[0], match, local_rc);
+        }
+#endif
         APP_LOGI(TAG,
                  "BLE scan device #%lu addr=%s rssi=%d event=%u name=\"%s\" candidate=%s preferred=%s nintendo_mfg=%s appearance=%s%u mfg_len=%u mfg=\"%s\"",
                  (unsigned long)index,
@@ -1185,6 +1230,102 @@ static void start_post_init_subscriptions(void)
     schedule_subscribe_next();
 }
 
+static void pairing_abort(const char *reason)
+{
+    APP_LOGE(TAG, "[PAIR] failed stage=%u reason=%s; disconnecting without further pairing writes",
+             (unsigned)s_pairing.stage, reason);
+    ble_npl_callout_stop(&s_pairing_timeout);
+    switch2_pairing_clear(&s_pairing);
+    s_pairing.stage = SWITCH2_PAIR_FAILED;
+    s_init_started = false;
+    int rc = ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    if (rc != 0) {
+        APP_LOGE(TAG, "[PAIR] terminate failed rc=%d", rc);
+    }
+}
+
+static void pairing_timeout_cb(struct ble_npl_event *event)
+{
+    (void)event;
+    if (s_connected && s_pairing.stage >= SWITCH2_PAIR_ADDRESS &&
+        s_pairing.stage <= SWITCH2_PAIR_FINALIZE) {
+        int64_t remaining = s_pairing_deadline_us - esp_timer_get_time();
+        if (remaining <= 0) {
+            pairing_abort("reply_timeout");
+        } else {
+            /* Handle an early tick or an already-queued event from a previous
+             * step without dropping the current step's timeout. */
+            if (ble_npl_callout_reset(&s_pairing_timeout,
+                    ble_npl_time_ms_to_ticks32((uint32_t)((remaining + 999) / 1000))) != 0) {
+                pairing_abort("timer_failed");
+            }
+        }
+    }
+}
+
+static void pairing_send(void)
+{
+    uint8_t command[25];
+    size_t len = switch2_pairing_command(&s_pairing, command);
+    if (!len) {
+        pairing_abort("invalid_stage");
+        return;
+    }
+    int rc = s_cmd_write_no_rsp ?
+        ble_gattc_write_no_rsp_flat(s_conn_handle, s_cmd_val_handle, command, len) :
+        ble_gattc_write_flat(s_conn_handle, s_cmd_val_handle, command, len, NULL, NULL);
+    mbedtls_platform_zeroize(command, sizeof(command));
+    if (rc != 0) {
+        pairing_abort("write_failed");
+        return;
+    }
+    s_pairing_deadline_us = esp_timer_get_time() + 3000000LL;
+    if (ble_npl_callout_reset(&s_pairing_timeout, ble_npl_time_ms_to_ticks32(3000)) != 0) {
+        pairing_abort("timer_failed");
+        return;
+    }
+    APP_LOGI(TAG, "[PAIR] sent stage=%u", (unsigned)s_pairing.stage);
+}
+
+static bool pairing_requested(const ble_addr_t *peer)
+{
+    const scanned_device_t *latest = NULL;
+    for (size_t i = 0; i < BLE_SCAN_CACHE_MAX; ++i) {
+        const scanned_device_t *item = &s_scan_cache[i];
+        if (item->used && item->pairing_ad_known && item->addr.type == peer->type &&
+            !memcmp(item->addr.val, peer->val, 6) &&
+            (!latest || item->index > latest->index)) {
+            latest = item;
+        }
+    }
+    return latest && latest->pairing_mode &&
+        esp_timer_get_time() - latest->seen_us < 30000000LL;
+}
+
+static void pairing_start_or_skip(void)
+{
+    struct ble_gap_conn_desc desc;
+    uint8_t local[6];
+    if (ble_gap_conn_find(s_conn_handle, &desc) != 0 ||
+        ble_hs_id_copy_addr(s_own_addr_type, local, NULL) != 0) {
+        pairing_abort("identity_unavailable");
+        return;
+    }
+    if (!pairing_requested(&desc.peer_ota_addr)) {
+        APP_LOGI(TAG, "[PAIR] skipped reason=reconnect_or_no_fresh_pairing_advertisement");
+        s_init_index++;
+        send_current_init_command();
+        return;
+    }
+    uint8_t entropy[32];
+    esp_fill_random(entropy, sizeof(entropy));
+    switch2_pairing_begin(&s_pairing, local, desc.peer_ota_addr.val, entropy);
+    mbedtls_platform_zeroize(entropy, sizeof(entropy));
+    APP_LOGI(TAG, "[PAIR] starting host=%02x:%02x:%02x:%02x:%02x:%02x address_count=1",
+             local[5], local[4], local[3], local[2], local[1], local[0]);
+    pairing_send();
+}
+
 static void send_current_init_command(void)
 {
     if (!s_connected || s_cmd_val_handle == 0) {
@@ -1198,6 +1339,11 @@ static void send_current_init_command(void)
         s_init_done = true;
         APP_LOGI(TAG, "BLE init complete; enabling input notifications");
         start_post_init_subscriptions();
+        return;
+    }
+
+    if (s_init_index == 3) {
+        pairing_start_or_skip();
         return;
     }
 
@@ -1234,10 +1380,58 @@ static void advance_ble_init_from_ack(const uint8_t *data, uint16_t len)
         return;
     }
 
+    if (s_init_index == 3) {
+        /* Key material and challenges are deliberately excluded from raw logs. */
+        unsigned stage = s_pairing.stage;
+        int result = switch2_pairing_reply(&s_pairing, data, len);
+        if (result == 0) {
+            APP_LOGW(TAG, "[PAIR] ignored unrelated reply stage=%u len=%u", stage, (unsigned)len);
+            return;
+        }
+        ble_npl_callout_stop(&s_pairing_timeout);
+        if (result < 0) {
+            pairing_abort("invalid_reply_or_challenge");
+        } else if (result == 2) {
+            APP_LOGI(TAG, "[PAIR] complete controller_commit_ack=true challenge_verified=true");
+            s_init_index++;
+            send_current_init_command();
+        } else {
+            APP_LOGI(TAG, "[PAIR] reply_valid stage=%u", stage);
+            pairing_send();
+        }
+        return;
+    }
+    const switch2_init_command_t *expected_ack = &s_init_commands[s_init_index];
+    /* RUMBLE_ENABLE uses direction 0x04 on this controller; all other replies
+     * use 0x01. Do not advance on delayed replies from another command. */
+    bool direction_ok = len >= 2 && (data[1] == 0x01 ||
+        (s_init_index == 11 && data[1] == 0x04));
+    if (len < 8 || !direction_ok || data[0] != expected_ack->data[0] ||
+        data[2] != 1 || data[3] != expected_ack->data[3]) {
+        APP_LOGW(TAG, "BLE init ignoring unrelated ACK index=%u len=%u", (unsigned)s_init_index, (unsigned)len);
+        return;
+    }
+    if (data[5] != 0x78) {
+        pairing_abort("init_negative_ack");
+        return;
+    }
     APP_LOGI(TAG, "BLE init ACK index=%u len=%u first=0x%02x",
              (unsigned)s_init_index,
              (unsigned)len,
              len > 0 ? data[0] : 0);
+#if PRO2_PAIRING_DIAGNOSTICS
+    char reply[3 * BLE_NOTIFY_BUF_MAX + 1];
+    size_t shown = len < BLE_NOTIFY_BUF_MAX ? len : BLE_NOTIFY_BUF_MAX;
+    format_hex_full(data, shown, reply, sizeof(reply));
+    const switch2_init_command_t *expected = &s_init_commands[s_init_index];
+    bool header_match = len >= 4 && expected->len >= 4 &&
+        data[0] == expected->data[0] && direction_ok &&
+        data[2] == expected->data[2] && data[3] == expected->data[3];
+    /* Observation only: retain the existing ACK advancement behavior. */
+    APP_LOGI(TAG, "[PAIR_DIAG] init_reply index=%u expected=%s header_match=%s len=%u shown=%u raw=\"%s\"",
+             (unsigned)s_init_index, expected->name, header_match ? "yes" : "no",
+             (unsigned)len, (unsigned)shown, reply);
+#endif
     s_init_index++;
     send_current_init_command();
 }
@@ -1623,9 +1817,6 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_DISC_COMPLETE:
         {
-        portENTER_CRITICAL(&s_idle_wake_lock);
-        s_idle_wake.observing = false;
-        portEXIT_CRITICAL(&s_idle_wake_lock);
         bool auto_scan = s_auto_scan_connect;
         s_conn_metrics.scan_complete_count++;
         s_conn_metrics.last_scan_complete_reason = event->disc_complete.reason;
@@ -1710,6 +1901,9 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         return 0;
 
     case BLE_GAP_EVENT_DISCONNECT:
+        portENTER_CRITICAL(&s_idle_wake_lock);
+        ble_idle_wake_disconnected(&s_idle_wake, esp_timer_get_time());
+        portEXIT_CRITICAL(&s_idle_wake_lock);
         s_conn_metrics.disconnect_count++;
         s_conn_metrics.last_disconnect_reason = event->disconnect.reason;
         s_conn_metrics.last_disconnect_us = esp_timer_get_time();
@@ -1769,6 +1963,13 @@ static void ble_on_sync(void)
 
     s_host_ready = true;
     APP_LOGI(TAG, "NimBLE host ready own_addr_type=%u", s_own_addr_type);
+#if PRO2_PAIRING_DIAGNOSTICS
+    ble_addr_t local = {.type = s_own_addr_type};
+    int local_rc = ble_hs_id_copy_addr(s_own_addr_type, local.val, NULL);
+    char local_text[32];
+    format_addr(&local, local_text, sizeof(local_text));
+    APP_LOGI(TAG, "[PAIR_DIAG] receiver_addr=%s rc=%d", local_text, local_rc);
+#endif
     schedule_auto_reconnect("host_sync", BLE_AUTO_RECONNECT_INITIAL_DELAY_MS);
 }
 
@@ -1804,6 +2005,9 @@ void ble_central_init(void)
         return;
     }
 
+    ble_npl_callout_init(&s_pairing_timeout, nimble_port_get_dflt_eventq(), pairing_timeout_cb, NULL);
+    s_pairing_timer_ready = true;
+
     ble_hs_cfg.reset_cb = ble_on_reset;
     ble_hs_cfg.sync_cb = ble_on_sync;
 
@@ -1819,7 +2023,7 @@ void ble_central_init(void)
 static esp_err_t ble_central_connect_addr(const ble_addr_t *target, const char *label)
 {
     if (idle_wake_blocked()) {
-        APP_LOGI(TAG, "[PRO2_IDLE] connect_blocked=true waiting_for=controller_wake");
+        APP_LOGI(TAG, "[PRO2_IDLE] connect_blocked=true reconnect_delay_ms=1000");
         return ESP_ERR_INVALID_STATE;
     }
     if (!target) {
@@ -1903,8 +2107,8 @@ static esp_err_t ble_central_start_scan_internal(bool auto_connect,
     disc_params.filter_policy = 0;
     disc_params.limited = 0;
     if (idle_wake_blocked()) {
-        /* Keep listening continuously until the disconnected peer wakes.
-         * A normal intermittent scan could mistake radio downtime for sleep.
+        /* Keep listening for the peer across the fixed deadline. Duplicate
+         * filtering must not hide its first advertisement after the delay.
          */
         if (auto_connect) {
             duration_ms = BLE_HS_FOREVER;
@@ -1912,9 +2116,6 @@ static esp_err_t ble_central_start_scan_internal(bool auto_connect,
         disc_params.filter_duplicates = 0;
         disc_params.itvl = 0x30;
         disc_params.window = 0x30;
-        portENTER_CRITICAL(&s_idle_wake_lock);
-        ble_idle_wake_scan_started(&s_idle_wake, esp_timer_get_time());
-        portEXIT_CRITICAL(&s_idle_wake_lock);
     }
 
     s_scan_seen_count = 0;
@@ -1934,9 +2135,6 @@ static esp_err_t ble_central_start_scan_internal(bool auto_connect,
     int rc = ble_gap_disc(s_own_addr_type, duration_ms, &disc_params, ble_gap_event, NULL);
     s_conn_metrics.last_scan_start_rc = rc;
     if (rc != 0) {
-        portENTER_CRITICAL(&s_idle_wake_lock);
-        s_idle_wake.observing = false;
-        portEXIT_CRITICAL(&s_idle_wake_lock);
         s_state = BLE_STATE_IDLE;
         s_auto_scan_connect = false;
         s_auto_scan_target_valid = false;
@@ -2031,9 +2229,9 @@ esp_err_t ble_central_disconnect_until_wake(void)
     }
     portENTER_CRITICAL(&s_idle_wake_lock);
     s_idle_peer = desc.peer_ota_addr;
-    s_idle_wake = (ble_idle_wake_t){.blocked = true};
+    ble_idle_wake_arm(&s_idle_wake);
     portEXIT_CRITICAL(&s_idle_wake_lock);
-    /* Keep normal reconnection scheduling: scans are gated until a new wake. */
+    /* Keep normal reconnection scheduling; advertisements cannot extend the delay. */
     s_suppress_next_auto_reconnect = false;
     int rc = ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     if (rc != 0) {
@@ -2043,7 +2241,7 @@ esp_err_t ble_central_disconnect_until_wake(void)
         APP_LOGW(TAG, "[PRO2_IDLE] disconnect_failed rc=%d", rc);
         return ESP_FAIL;
     }
-    APP_LOGI(TAG, "[PRO2_IDLE] disconnect_requested=true waiting_for=controller_wake");
+    APP_LOGI(TAG, "[PRO2_IDLE] disconnect_requested=true reconnect_delay_ms=1000");
     return ESP_OK;
 }
 

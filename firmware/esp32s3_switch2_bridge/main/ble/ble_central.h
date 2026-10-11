@@ -47,7 +47,7 @@ esp_err_t ble_central_connect(const char *address_or_name);
 esp_err_t ble_central_reconnect_saved_or_scan(void);
 void ble_central_start_auto_reconnect(void);
 void ble_central_disconnect(void);
-/* Disconnect after inactivity; require a quiet advertising period before wake. */
+/* Disconnect after inactivity; allow reconnect after a fixed one-second delay. */
 esp_err_t ble_central_disconnect_until_wake(void);
 esp_err_t ble_central_recover_stale_link(void);
 esp_err_t ble_central_request_fast_params(void);
