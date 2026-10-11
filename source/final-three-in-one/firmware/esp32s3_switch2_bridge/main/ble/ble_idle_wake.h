@@ -23,13 +23,13 @@ static inline void ble_idle_wake_disconnected(ble_idle_wake_t *gate, int64_t now
     }
 }
 
-static inline bool ble_idle_wake_advertisement(ble_idle_wake_t *gate,
-                                              bool same_peer, int64_t now_us)
+/* Readiness depends only on elapsed time, never a controller address. */
+static inline bool ble_idle_wake_ready(ble_idle_wake_t *gate, int64_t now_us)
 {
     if (!gate->blocked) {
         return true;
     }
-    if (!same_peer || now_us < gate->resume_after_us) {
+    if (now_us < gate->resume_after_us) {
         return false;
     }
     gate->blocked = false;

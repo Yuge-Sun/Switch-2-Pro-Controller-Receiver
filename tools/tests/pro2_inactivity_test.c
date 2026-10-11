@@ -67,22 +67,24 @@ static void test_controls(void)
 static void test_disconnect_and_wake(void)
 {
     ble_idle_wake_t gate = {0};
+    assert(ble_idle_wake_ready(&gate, 0));
     ble_idle_wake_arm(&gate);
-    assert(!ble_idle_wake_advertisement(&gate, true, 600000000LL));
+    assert(!ble_idle_wake_ready(&gate, 600000000LL));
     ble_idle_wake_disconnected(&gate, 600000000LL);
     /* Even continuous advertisements cannot move the absolute deadline. */
     for (int ms = 0; ms < 1000; ++ms) {
-        assert(!ble_idle_wake_advertisement(&gate, true, 600000000LL + ms * 1000LL));
+        assert(!ble_idle_wake_ready(&gate, 600000000LL + ms * 1000LL));
     }
-    assert(!ble_idle_wake_advertisement(&gate, true, 600999999LL));
-    assert(!ble_idle_wake_advertisement(&gate, false, 601000000LL));
-    assert(ble_idle_wake_advertisement(&gate, true, 601000000LL));
+    assert(!ble_idle_wake_ready(&gate, 600999999LL));
+    /* The deadline releases all controllers; no original peer is needed. */
+    assert(ble_idle_wake_ready(&gate, 601000000LL));
     assert(!gate.blocked);
+    assert(ble_idle_wake_ready(&gate, 601000001LL));
     /* Delayed scanning does not start another waiting period. */
     ble_idle_wake_arm(&gate);
     ble_idle_wake_disconnected(&gate, 700000000LL);
     ble_idle_wake_disconnected(&gate, 700500000LL);
-    assert(ble_idle_wake_advertisement(&gate, true, 710000000LL));
+    assert(ble_idle_wake_ready(&gate, 710000000LL));
     usb_source_presence_t usb = {.attached = true};
     assert(!usb_source_presence_wanted(&usb, false, false, true, 0, 700000000LL));
     usb_source_presence_detached(&usb, 700000000LL);

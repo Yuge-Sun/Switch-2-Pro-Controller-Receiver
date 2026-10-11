@@ -38,12 +38,11 @@
 static const char *TAG = "ble";
 static portMUX_TYPE s_idle_wake_lock = portMUX_INITIALIZER_UNLOCKED;
 static ble_idle_wake_t s_idle_wake;
-static ble_addr_t s_idle_peer;
 
 static bool idle_wake_blocked(void)
 {
     portENTER_CRITICAL(&s_idle_wake_lock);
-    bool blocked = s_idle_wake.blocked;
+    bool blocked = !ble_idle_wake_ready(&s_idle_wake, esp_timer_get_time());
     portEXIT_CRITICAL(&s_idle_wake_lock);
     return blocked;
 }
@@ -1250,9 +1249,7 @@ static void log_adv_report(const struct ble_gap_disc_desc *disc)
      */
     portENTER_CRITICAL(&s_idle_wake_lock);
     bool was_blocked = s_idle_wake.blocked;
-    bool allowed = ble_idle_wake_advertisement(
-        &s_idle_wake, same_addr_value(&disc->addr, &s_idle_peer),
-        esp_timer_get_time());
+    bool allowed = ble_idle_wake_ready(&s_idle_wake, esp_timer_get_time());
     portEXIT_CRITICAL(&s_idle_wake_lock);
     if (!allowed) {
         return;
@@ -2715,8 +2712,8 @@ static esp_err_t ble_central_start_scan_internal(bool auto_connect,
     disc_params.filter_policy = 0;
     disc_params.limited = 0;
     if (idle_wake_blocked()) {
-        /* Keep listening for the peer across the fixed deadline. Duplicate
-         * filtering must not hide its first advertisement after the delay.
+        /* Keep listening across the fixed deadline. Duplicate filtering
+         * must not hide a controller's first advertisement after the delay.
          */
         if (auto_connect) {
             duration_ms = BLE_HS_FOREVER;
@@ -2835,12 +2832,7 @@ esp_err_t ble_central_disconnect_until_wake(void)
     if (!s_connected || s_state != BLE_STATE_CONNECTED) {
         return ESP_ERR_INVALID_STATE;
     }
-    struct ble_gap_conn_desc desc;
-    if (ble_gap_conn_find(s_conn_handle, &desc) != 0) {
-        return ESP_FAIL;
-    }
     portENTER_CRITICAL(&s_idle_wake_lock);
-    s_idle_peer = desc.peer_ota_addr;
     ble_idle_wake_arm(&s_idle_wake);
     portEXIT_CRITICAL(&s_idle_wake_lock);
     /* Keep normal reconnection scheduling; advertisements cannot extend the delay. */

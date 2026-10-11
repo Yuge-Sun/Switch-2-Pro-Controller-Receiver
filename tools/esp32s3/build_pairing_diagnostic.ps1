@@ -15,8 +15,8 @@ $output = Join-Path $shortRoot 'work/firmware/pairing-diagnostic-v2'
 $stem = 'ps5-pairing-diagnostic'
 $diagnostics = 'ON'
 if ($Regular) {
-    $output = Join-Path $shortRoot 'work/firmware/idle-10min-1sec'
-    $stem = 'ps5-idle-10min-1sec'
+    $output = Join-Path $shortRoot 'work/firmware/idle-10min-any-controller'
+    $stem = 'ps5-idle-10min-any-controller'
     $diagnostics = 'OFF'
 }
 $config = Join-Path $build 'sdkconfig'
