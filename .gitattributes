@@ -1,14 +1,7 @@
 * text=auto
-
-*.sh text eol=lf
-*.ps1 text
-*.java text
-*.cs text
-*.md text
-*.js text
-*.html text
-
-*.jar binary
-*.exe binary
-*.dll binary
-*.zip binary
+*.c text eol=lf
+*.h text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
+*.lock text eol=lf
+*.md text eol=lf

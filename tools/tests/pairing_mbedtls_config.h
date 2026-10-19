@@ -1,2 +1,0 @@
-#define MBEDTLS_AES_C
-#define MBEDTLS_PLATFORM_C

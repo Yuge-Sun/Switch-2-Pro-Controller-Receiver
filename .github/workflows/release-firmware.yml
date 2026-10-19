@@ -1,0 +1,68 @@
+name: Build release firmware
+
+on:
+  push:
+    tags: ['v*']
+    paths:
+      - 'firmware/**'
+      - '.github/workflows/release-firmware.yml'
+  pull_request:
+    paths:
+      - 'firmware/**'
+      - '.github/workflows/release-firmware.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.4.2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build PS5 receiver for ESP32-S3 with 16 MB flash
+        working-directory: firmware
+        shell: bash
+        run: |
+          set -eo pipefail
+          . "$IDF_PATH/export.sh"
+          idf.py set-target esp32s3
+          idf.py build
+          mkdir -p dist
+          cd build
+          python -m esptool --chip esp32s3 merge_bin -o ../dist/esp32s3-receiver.bin @flash_args
+          cd ../dist
+          sha256sum esp32s3-receiver.bin > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: esp32s3-receiver
+          path: |
+            firmware/dist/esp32s3-receiver.bin
+            firmware/dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: esp32s3-receiver
+          path: dist
+      - name: Publish firmware to the tagged GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes --title "$RELEASE_TAG"
+          fi

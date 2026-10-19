@@ -1,44 +1,14 @@
-# Local build output
+# Generated ESP-IDF files and release output
 build/
-work/
-logs/
-bin/
-obj/
-.vs/
+managed_components/
+sdkconfig
+sdkconfig.old
+dist/
+
+# Local caches and temporary files
 .toolchain/
+work/
 __pycache__/
-_handoff/
-CODEX_HANDOFF_*.md
-
-# Generated ESP-IDF state
-firmware/esp32s3_switch2_bridge/build/
-firmware/esp32s3_switch2_bridge/managed_components/
-firmware/esp32s3_switch2_bridge/sdkconfig
-firmware/esp32s3_switch2_bridge/sdkconfig.old
-firmware/esp32s3_dualsense_identity_experiment/build/
-firmware/esp32s3_dualsense_identity_experiment/managed_components/
-firmware/esp32s3_dualsense_identity_experiment/sdkconfig
-firmware/esp32s3_dualsense_identity_experiment/sdkconfig.old
-
-# Local tooling output
-tools/*.exe
-tools/*.log
-tools/steam_input_probe_runtime/steam_api64.dll
-
-# Temporary files
 *.log
 *.tmp
 *.bak
-*.user
-*.suo
-*.pdb
-*.ilk
-*.obj
-*.class
-*.zip
-
-# Keep final release artifacts tracked.
-!release/
-!release/v5.9/
-!release/v5.9/**
-release/v5.9/DualSenseHostTrace-v5.9.2/
