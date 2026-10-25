@@ -12,7 +12,6 @@
 #include "freertos/task.h"
 
 static const char *TAG = "v5.5_pro2";
-static bool s_seen_connected;
 
 #define PRO2_NOTIFY_START_GRACE_US 8000000LL
 #define PRO2_NOTIFY_STALE_RECOVERY_US 1000000LL
@@ -28,8 +27,6 @@ static void reconnect_watchdog_task(void *arg)
     while (true) {
         const char *state = ble_central_state_string();
         if (strcmp(state, "connected") == 0) {
-            s_seen_connected = true;
-
             ble_central_conn_metrics_t metrics;
             ble_central_get_conn_metrics(&metrics);
             int64_t now_us = esp_timer_get_time();
@@ -71,22 +68,11 @@ static void reconnect_watchdog_task(void *arg)
         }
         if (strcmp(state, "idle") == 0) {
             attempt++;
-            if (s_seen_connected) {
-                ble_central_start_auto_reconnect();
-                ESP_LOGI(TAG,
-                         "[PRO2_INPUT] wake_reconnect_wait attempt=%lu",
-                         (unsigned long)attempt);
-            } else {
-                esp_err_t err = ble_central_reconnect_saved_or_scan();
-                if (err != ESP_OK) {
-                    ble_central_start_auto_reconnect();
-                }
-                ESP_LOGI(TAG,
-                         "[PRO2_INPUT] reconnect_attempt=%lu started=%s err=%s",
-                         (unsigned long)attempt,
-                         err == ESP_OK ? "true" : "false",
-                         esp_err_to_name(err));
-            }
+            /* One worker owns automatic scanning, including before the first
+             * connection. Watchdog checks never reset its fast-scan deadline. */
+            ble_central_start_auto_reconnect();
+            ESP_LOGI(TAG, "[PRO2_INPUT] wake_reconnect_wait attempt=%lu",
+                     (unsigned long)attempt);
         }
 
         vTaskDelay(pdMS_TO_TICKS(1500));
@@ -100,14 +86,7 @@ void pro2_input_backend_init(void)
     switch2_state_init();
     ble_central_init();
     if (device_config_get_ble_autoconnect()) {
-        esp_err_t err = ble_central_reconnect_saved_or_scan();
-        if (err != ESP_OK) {
-            ble_central_start_auto_reconnect();
-        }
-        ESP_LOGI(TAG,
-                 "[PRO2_INPUT] initial_reconnect started=%s err=%s",
-                 err == ESP_OK ? "true" : "false",
-                 esp_err_to_name(err));
+        ble_central_start_auto_reconnect();
     }
 
     BaseType_t created = xTaskCreate(reconnect_watchdog_task,

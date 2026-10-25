@@ -9,6 +9,8 @@ typedef enum {
 
 /* Task-context APIs. Initialize before starting the NimBLE host or workers. */
 void ble_runtime_init(void);
+/* Call after nimble_port_init enables the Bluetooth controller. */
+void ble_runtime_controller_ready(void);
 ble_state_t ble_runtime_state(void);
 void ble_runtime_set_state(ble_state_t state);
 /* Broadcast, level-triggered wait: a connection before the wait is not lost.
