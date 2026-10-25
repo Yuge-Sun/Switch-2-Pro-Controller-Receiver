@@ -26,6 +26,7 @@
 #include "switch2_battery_client.h"
 #include "ble_central.h"
 #include "ble_idle_wake.h"
+#include "ble_runtime.h"
 #include "switch2_pairing.h"
 #include "esp_random.h"
 #include "mbedtls/platform_util.h"
@@ -79,13 +80,6 @@ static bool idle_wake_blocked(void)
 #define BLE_AUTO_RECONNECT_SLOW_SCAN_MS 30000
 #define BLE_AUTO_RECONNECT_SLOW_IDLE_MS 250
 
-typedef enum {
-    BLE_STATE_IDLE = 0,
-    BLE_STATE_SCANNING,
-    BLE_STATE_CONNECTING,
-    BLE_STATE_CONNECTED
-} ble_state_t;
-
 typedef struct {
     bool used;
     uint32_t index;
@@ -131,7 +125,6 @@ typedef struct {
     uint16_t len;
 } switch2_init_command_t;
 
-static ble_state_t s_state = BLE_STATE_IDLE;
 static bool s_host_ready;
 static bool s_connected;
 static uint8_t s_own_addr_type;
@@ -194,6 +187,7 @@ static uint32_t s_last_read_poll_control_fingerprint;
 static bool s_last_read_poll_motion_fingerprint_valid;
 static uint32_t s_last_read_poll_motion_fingerprint;
 static TaskHandle_t s_auto_reconnect_task;
+static volatile bool s_auto_reconnect_stop;
 static TaskHandle_t s_auto_connect_selected_task;
 static TaskHandle_t s_read_poll_task;
 static bool s_suppress_next_auto_reconnect;
@@ -241,8 +235,8 @@ static void ble_auto_reconnect_task(void *arg)
 
     uint32_t attempt = 0;
     TickType_t start_tick = xTaskGetTickCount();
-    while (device_config_get_ble_autoconnect()) {
-        if (s_connected || s_state == BLE_STATE_CONNECTED) {
+    while (!s_auto_reconnect_stop && device_config_get_ble_autoconnect()) {
+        if (s_connected || ble_runtime_state() == BLE_STATE_CONNECTED) {
             break;
         }
 
@@ -250,7 +244,7 @@ static void ble_auto_reconnect_task(void *arg)
                                          portTICK_PERIOD_MS);
         bool fast_window = elapsed_ms < BLE_AUTO_RECONNECT_FAST_WINDOW_MS;
         if (s_host_ready &&
-            s_state == BLE_STATE_IDLE &&
+            ble_runtime_state() == BLE_STATE_IDLE &&
             !ble_gap_disc_active() &&
             !ble_gap_conn_active()) {
             uint32_t scan_ms = fast_window ?
@@ -285,10 +279,10 @@ static void schedule_auto_reconnect(const char *reason, uint32_t delay_ms)
                  reason ? reason : "<none>");
         return;
     }
-    if (s_connected || s_state == BLE_STATE_CONNECTED) {
+    if (s_connected || ble_runtime_state() == BLE_STATE_CONNECTED) {
         return;
     }
-    if (s_auto_reconnect_task) {
+    if (s_auto_reconnect_task || s_auto_reconnect_stop) {
         return;
     }
 
@@ -376,7 +370,7 @@ static void ble_auto_connect_selected(void *arg)
         s_auto_scan_target_valid = false;
         s_auto_scan_connect = false;
         s_auto_scan_preferred_valid = false;
-        s_state = BLE_STATE_IDLE;
+        ble_runtime_set_state(BLE_STATE_IDLE);
         APP_LOGI(TAG, "BLE autoconnect scan cancel settled; connecting target=%s",
                  label);
         (void)ble_central_connect_addr(&target, label);
@@ -2382,8 +2376,8 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         APP_LOGI(TAG, "BLE scan complete reason=%d seen=%lu",
                  event->disc_complete.reason,
                  (unsigned long)s_scan_seen_count);
-        if (!s_connected && s_state == BLE_STATE_SCANNING) {
-            s_state = BLE_STATE_IDLE;
+        if (!s_connected && ble_runtime_state() == BLE_STATE_SCANNING) {
+            ble_runtime_set_state(BLE_STATE_IDLE);
         }
         if (s_auto_scan_target_valid) {
             ble_addr_t target = s_auto_scan_target;
@@ -2410,7 +2404,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         if (event->connect.status == 0) {
             s_connected = true;
             s_conn_handle = event->connect.conn_handle;
-            s_state = BLE_STATE_CONNECTED;
+            ble_runtime_set_state(BLE_STATE_CONNECTED);
             s_fast_live_request_sent = false;
             s_live_parsed_since_connect = 0;
             s_conn_metrics.connect_success_count++;
@@ -2429,7 +2423,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         } else {
             s_connected = false;
             s_conn_handle = 0;
-            s_state = BLE_STATE_IDLE;
+            ble_runtime_set_state(BLE_STATE_IDLE);
             s_pending_connect_valid = false;
             s_conn_metrics.connect_failure_count++;
             clear_conn_metrics();
@@ -2481,7 +2475,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         note_fast_param_drop_if_needed(event->disconnect.reason);
         s_connected = false;
         s_conn_handle = 0;
-        s_state = BLE_STATE_IDLE;
+        ble_runtime_set_state(BLE_STATE_IDLE);
         s_fast_live_request_sent = false;
         s_live_parsed_since_connect = 0;
         clear_gatt_cache();
@@ -2510,7 +2504,7 @@ static void ble_on_reset(int reason)
 {
     s_host_ready = false;
     s_connected = false;
-    s_state = BLE_STATE_IDLE;
+    ble_runtime_set_state(BLE_STATE_IDLE);
     s_fast_live_request_sent = false;
     s_live_parsed_since_connect = 0;
     s_auto_scan_connect = false;
@@ -2552,7 +2546,8 @@ static void ble_host_task(void *param)
 
 void ble_central_init(void)
 {
-    s_state = BLE_STATE_IDLE;
+    ble_runtime_init();
+    ble_runtime_set_state(BLE_STATE_IDLE);
     s_host_ready = false;
     s_connected = false;
     s_conn_handle = 0;
@@ -2564,6 +2559,7 @@ void ble_central_init(void)
     s_auto_scan_preferred_valid = false;
     s_pending_connect_valid = false;
     s_auto_reconnect_task = NULL;
+    s_auto_reconnect_stop = false;
     s_auto_connect_selected_task = NULL;
     s_suppress_next_auto_reconnect = false;
     memset(s_scan_cache, 0, sizeof(s_scan_cache));
@@ -2627,7 +2623,7 @@ static esp_err_t ble_central_connect_addr(const ble_addr_t *target, const char *
     switch2_state_clear_live();
     s_pending_connect_addr = *target;
     s_pending_connect_valid = true;
-    s_state = BLE_STATE_CONNECTING;
+    ble_runtime_set_state(BLE_STATE_CONNECTING);
     s_conn_metrics.connect_start_count++;
     APP_LOGI(TAG, "BLE connect start target=%s timeout_ms=%d",
              label ? label : "<addr>",
@@ -2636,7 +2632,7 @@ static esp_err_t ble_central_connect_addr(const ble_addr_t *target, const char *
     int rc = ble_gap_connect(s_own_addr_type, target, BLE_CONNECT_TIMEOUT_MS, &s_safe_connect_params, ble_gap_event, NULL);
     s_conn_metrics.last_connect_start_rc = rc;
     if (rc != 0) {
-        s_state = BLE_STATE_IDLE;
+        ble_runtime_set_state(BLE_STATE_IDLE);
         s_pending_connect_valid = false;
         APP_LOGE(TAG, "BLE connect start failed rc=%d", rc);
         return ESP_FAIL;
@@ -2654,12 +2650,12 @@ static esp_err_t ble_central_start_scan_internal(bool auto_connect,
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (s_connected || s_state == BLE_STATE_CONNECTED) {
+    if (s_connected || ble_runtime_state() == BLE_STATE_CONNECTED) {
         APP_LOGW(TAG, "BLE scan ignored while connected; disconnect first");
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (s_state == BLE_STATE_CONNECTING || ble_gap_conn_active()) {
+    if (ble_runtime_state() == BLE_STATE_CONNECTING || ble_gap_conn_active()) {
         APP_LOGW(TAG, "BLE scan ignored while a connection attempt is in progress");
         return ESP_ERR_INVALID_STATE;
     }
@@ -2698,7 +2694,7 @@ static esp_err_t ble_central_start_scan_internal(bool auto_connect,
     if (s_auto_scan_preferred_valid) {
         s_auto_scan_preferred = *preferred;
     }
-    s_state = BLE_STATE_SCANNING;
+    ble_runtime_set_state(BLE_STATE_SCANNING);
     APP_LOGI(TAG, "BLE active scan started duration_ms=%lu auto_connect=%s preferred=%s",
              (unsigned long)duration_ms,
              auto_connect ? "yes" : "no",
@@ -2707,7 +2703,7 @@ static esp_err_t ble_central_start_scan_internal(bool auto_connect,
     int rc = ble_gap_disc(s_own_addr_type, duration_ms, &disc_params, ble_gap_event, NULL);
     s_conn_metrics.last_scan_start_rc = rc;
     if (rc != 0) {
-        s_state = BLE_STATE_IDLE;
+        ble_runtime_set_state(BLE_STATE_IDLE);
         s_auto_scan_connect = false;
         s_auto_scan_target_valid = false;
         s_auto_scan_preferred_valid = false;
@@ -2770,7 +2766,7 @@ esp_err_t ble_central_connect(const char *address_or_name)
 
 esp_err_t ble_central_reconnect_saved_or_scan(void)
 {
-    if (s_connected || s_state == BLE_STATE_CONNECTED) {
+    if (s_connected || ble_runtime_state() == BLE_STATE_CONNECTED) {
         APP_LOGI(TAG, "BLE reconnect skipped; already connected");
         return ESP_OK;
     }
@@ -2792,7 +2788,7 @@ void ble_central_start_auto_reconnect(void)
 
 esp_err_t ble_central_disconnect_until_wake(void)
 {
-    if (!s_connected || s_state != BLE_STATE_CONNECTED) {
+    if (!s_connected || ble_runtime_state() != BLE_STATE_CONNECTED) {
         return ESP_ERR_INVALID_STATE;
     }
     portENTER_CRITICAL(&s_idle_wake_lock);
@@ -2815,15 +2811,21 @@ esp_err_t ble_central_disconnect_until_wake(void)
 void ble_central_disconnect(void)
 {
     ble_central_stop_read_poll_probe();
+    s_suppress_next_auto_reconnect = true;
+    s_auto_reconnect_stop = true;
+    if (s_auto_reconnect_task && s_auto_reconnect_task != xTaskGetCurrentTaskHandle()) {
+        /* Never delete a task that may own the runtime/PM mutex. Let it finish
+         * its current iteration before cancelling scanning below. This wait
+         * is only used by the explicit management disconnect command.
+         */
+        while (s_auto_reconnect_task) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
     s_auto_scan_connect = false;
     s_auto_scan_target_valid = false;
     s_auto_scan_preferred_valid = false;
     s_pending_connect_valid = false;
-    s_suppress_next_auto_reconnect = true;
-    if (s_auto_reconnect_task && s_auto_reconnect_task != xTaskGetCurrentTaskHandle()) {
-        vTaskDelete(s_auto_reconnect_task);
-        s_auto_reconnect_task = NULL;
-    }
     if (ble_gap_disc_active()) {
         (void)ble_gap_disc_cancel();
     }
@@ -2833,13 +2835,14 @@ void ble_central_disconnect(void)
     if (s_connected) {
         (void)ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
-    s_state = BLE_STATE_IDLE;
+    ble_runtime_set_state(BLE_STATE_IDLE);
+    s_auto_reconnect_stop = false;
     APP_LOGI(TAG, "BLE disconnect requested");
 }
 
 esp_err_t ble_central_recover_stale_link(void)
 {
-    if (!s_connected || s_state != BLE_STATE_CONNECTED) {
+    if (!s_connected || ble_runtime_state() != BLE_STATE_CONNECTED) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -2861,7 +2864,7 @@ esp_err_t ble_central_recover_stale_link(void)
 
     s_connected = false;
     s_conn_handle = 0;
-    s_state = BLE_STATE_IDLE;
+    ble_runtime_set_state(BLE_STATE_IDLE);
     ble_central_stop_read_poll_probe();
     clear_gatt_cache();
     clear_conn_metrics();
@@ -2892,7 +2895,7 @@ esp_err_t ble_central_start_multi_report_probe(void)
 
 esp_err_t ble_central_start_read_poll_probe(uint16_t rate_hz)
 {
-    if (!s_connected || s_state != BLE_STATE_CONNECTED || s_input_val_handle == 0) {
+    if (!s_connected || ble_runtime_state() != BLE_STATE_CONNECTED || s_input_val_handle == 0) {
         return ESP_ERR_INVALID_STATE;
     }
     if (rate_hz < BLE_READ_POLL_MIN_HZ || rate_hz > BLE_READ_POLL_MAX_HZ) {
@@ -2940,9 +2943,9 @@ void ble_central_get_conn_metrics(ble_central_conn_metrics_t *out_metrics)
         return;
     }
     *out_metrics = s_conn_metrics;
-    out_metrics->connected = s_connected || s_state == BLE_STATE_CONNECTED;
-    out_metrics->scanning = s_state == BLE_STATE_SCANNING || ble_gap_disc_active();
-    out_metrics->connecting = s_state == BLE_STATE_CONNECTING || ble_gap_conn_active();
+    out_metrics->connected = s_connected || ble_runtime_state() == BLE_STATE_CONNECTED;
+    out_metrics->scanning = ble_runtime_state() == BLE_STATE_SCANNING || ble_gap_disc_active();
+    out_metrics->connecting = ble_runtime_state() == BLE_STATE_CONNECTING || ble_gap_conn_active();
     out_metrics->reconnect_task_running = s_auto_reconnect_task != NULL;
     out_metrics->auto_scan_connect = s_auto_scan_connect;
     out_metrics->fast_param_block_remaining_ms =
@@ -3023,7 +3026,7 @@ esp_err_t ble_central_send_rumble(const uint8_t *data, uint16_t len)
 
 const char *ble_central_state_string(void)
 {
-    switch (s_state) {
+    switch (ble_runtime_state()) {
     case BLE_STATE_IDLE:
         return "idle";
     case BLE_STATE_SCANNING:
@@ -3035,4 +3038,9 @@ const char *ble_central_state_string(void)
     default:
         return "unknown";
     }
+}
+
+void ble_central_wait_connected(void)
+{
+    ble_runtime_wait_connected();
 }

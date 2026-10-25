@@ -135,6 +135,8 @@ typedef struct {
 } ble_central_conn_metrics_t;
 
 void ble_central_init(void);
+/* Task-context wait for a connection; callers recheck state after waking. */
+void ble_central_wait_connected(void);
 esp_err_t ble_central_start_scan(void);
 esp_err_t ble_central_connect(const char *address_or_name);
 esp_err_t ble_central_reconnect_saved_or_scan(void);

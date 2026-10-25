@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "ble/ble_central.c"
+        "ble/ble_runtime.c"
         "ble/switch2_battery_client.c"
         "ble/switch2_pairing.c"
         "ble/switch2_gatt.c"
@@ -11,5 +12,5 @@ idf_component_register(
         "config/device_config.c"
         "log/app_log.c"
     INCLUDE_DIRS "ble" "bridge" "config" "log"
-    REQUIRES bt nvs_flash esp_timer mbedtls esp_hw_support
+    REQUIRES bt nvs_flash esp_timer mbedtls esp_hw_support esp_pm
 )

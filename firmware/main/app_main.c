@@ -13,6 +13,7 @@
 #include "device/usbd_pvt.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_pm.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -82,6 +83,9 @@ static TaskHandle_t s_control_task_handle;
 static TaskHandle_t s_input_task_handle;
 static usb_source_presence_t s_usb_presence;
 static bool s_usb_driver_installed;
+/* Owned by the input task; held through USB detach even if BLE drops first. */
+static esp_pm_lock_handle_t s_usb_cpu_lock;
+static bool s_usb_cpu_locked;
 
 #define PRO2_INPUT_STALE_US 200000LL
 #define PRO2_INPUT_WARMUP_UPDATES 4
@@ -585,6 +589,10 @@ static void detach_source_usb(int64_t now_us)
     s_report_submit_failure_streak = 0;
     s_first_report_submit_failure_us = 0;
     s_last_report_us = 0;
+    if (s_usb_cpu_locked) {
+        ESP_ERROR_CHECK(esp_pm_lock_release(s_usb_cpu_lock));
+        s_usb_cpu_locked = false;
+    }
 }
 
 static void update_source_usb(bool connected, bool warmed_up,
@@ -603,6 +611,8 @@ static void update_source_usb(bool connected, bool warmed_up,
     }
 
     /* Discard any late bus events from the previous USB session. */
+    ESP_ERROR_CHECK(esp_pm_lock_acquire(s_usb_cpu_lock));
+    s_usb_cpu_locked = true;
     s_mounted = false;
     s_suspended = false;
     s_usb_configuration_ready = false;
@@ -875,12 +885,34 @@ static void neutral_report_task(void *arg)
             next_input_log_us = now_us + 5000000LL;
         }
 
+        if (!connected && !idle_disconnect_pending && !s_usb_presence.attached) {
+            /* USB cleanup is complete. The persistent BLE connection event
+             * wakes us even if reconnection races with entering this wait.
+             * Keep polling during asynchronous inactivity termination, input
+             * warmup and USB recovery so their existing deadlines still run.
+             */
+            ble_central_wait_connected();
+            next_wake = xTaskGetTickCount();
+            continue;
+        }
         xTaskDelayUntil(&next_wake, pdMS_TO_TICKS(DS5_SOURCE_POLL_MS));
     }
 }
 
 void app_main(void)
 {
+    /* Keep APB at 80 MHz and the radio awake. Only scale the CPUs when idle;
+     * BLE setup/gameplay and attached USB retain the original 240 MHz speed.
+     */
+    const esp_pm_config_t power_config = {
+        .max_freq_mhz = 240,
+        .min_freq_mhz = 80,
+        .light_sleep_enable = false,
+    };
+    ESP_ERROR_CHECK(esp_pm_configure(&power_config));
+    ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0,
+                                       "ds5_usb", &s_usb_cpu_lock));
+    ESP_LOGI(TAG, "[POWER] cpu_min_mhz=80 cpu_max_mhz=240 light_sleep=false");
     ESP_LOGI(TAG, "[DS5_IDENTITY] enabled=true mode=dualsense_experimental profile=%s",
              DS5_PROFILE_NAME);
     ESP_LOGI(TAG,

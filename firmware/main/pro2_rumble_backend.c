@@ -280,7 +280,7 @@ static void rumble_task(void *arg)
 
     while (true) {
         if (strcmp(pro2_input_backend_state(), "connected") != 0) {
-            vTaskDelay(pdMS_TO_TICKS(PRO2_RUMBLE_TICK_MS));
+            ble_central_wait_connected();
             continue;
         }
 
