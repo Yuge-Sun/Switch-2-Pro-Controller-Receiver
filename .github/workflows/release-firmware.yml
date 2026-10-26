@@ -1,11 +1,7 @@
-name: Build release firmware
+name: Build firmware
 
 on:
   push:
-    tags: ['v*']
-    paths:
-      - 'firmware/**'
-      - '.github/workflows/release-firmware.yml'
   pull_request:
     paths:
       - 'firmware/**'
@@ -41,28 +37,3 @@ jobs:
             firmware/dist/esp32s3-receiver.bin
             firmware/dist/SHA256SUMS.txt
           if-no-files-found: error
-
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: esp32s3-receiver
-          path: dist
-      - name: Publish firmware to the tagged GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" dist/* --clobber
-          else
-            gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes --title "$RELEASE_TAG"
-          fi
