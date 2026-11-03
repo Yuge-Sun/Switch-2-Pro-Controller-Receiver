@@ -9,6 +9,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
 #include "host/ble_hs.h"
@@ -91,7 +92,9 @@ static bool idle_wake_blocked(void)
 #define BLE_READ_POLL_MAX_HZ 1000
 #define BLE_AUTO_RECONNECT_INITIAL_DELAY_MS 1500
 #define BLE_AUTO_RECONNECT_AFTER_DROP_DELAY_MS 800
-#define BLE_AUTO_RECONNECT_CHECK_MS 250
+#define BLE_AUTO_RECONNECT_RETRY_MS 250
+#define RECONNECT_WAKE BIT0
+#define RECONNECT_STOPPED BIT1
 
 typedef struct {
     bool used;
@@ -201,6 +204,15 @@ static bool s_last_read_poll_motion_fingerprint_valid;
 static uint32_t s_last_read_poll_motion_fingerprint;
 static TaskHandle_t s_auto_reconnect_task;
 static volatile bool s_auto_reconnect_stop;
+static EventGroupHandle_t s_reconnect_events;
+static portMUX_TYPE s_reconnect_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_reconnect_requested;
+static int64_t s_reconnect_due_us;
+
+static void wake_reconnect_worker(void)
+{
+    if (s_reconnect_events) xEventGroupSetBits(s_reconnect_events, RECONNECT_WAKE);
+}
 static TaskHandle_t s_auto_connect_selected_task;
 static TaskHandle_t s_read_poll_task;
 static bool s_suppress_next_auto_reconnect;
@@ -239,74 +251,77 @@ static const struct ble_gap_upd_params s_safe_update_params = {
 static bool same_addr_value(const ble_addr_t *a, const ble_addr_t *b);
 static esp_err_t ble_central_start_wake_scan(void);
 
+/* Return a wait deadline only for scheduled work or an actual start failure.
+ * A healthy scan/connection/host-sync wait has no periodic wakeup. */
+static TickType_t auto_reconnect_step(void)
+{
+    if (s_auto_reconnect_stop) {
+        portENTER_CRITICAL(&s_reconnect_lock);
+        s_reconnect_requested = false;
+        portEXIT_CRITICAL(&s_reconnect_lock);
+        xEventGroupSetBits(s_reconnect_events, RECONNECT_STOPPED);
+        return portMAX_DELAY;
+    }
+    portENTER_CRITICAL(&s_reconnect_lock);
+    bool requested = s_reconnect_requested;
+    int64_t due_us = s_reconnect_due_us;
+    portEXIT_CRITICAL(&s_reconnect_lock);
+    if (!requested || !device_config_get_ble_autoconnect() || !s_host_ready ||
+        s_connected || ble_runtime_state() == BLE_STATE_CONNECTED) {
+        return portMAX_DELAY;
+    }
+    int64_t remaining_us = due_us - esp_timer_get_time();
+    if (remaining_us > 0) {
+        TickType_t wait_ticks = pdMS_TO_TICKS((uint32_t)((remaining_us + 999) / 1000));
+        return wait_ticks ? wait_ticks : 1;
+    }
+    if (ble_runtime_state() == BLE_STATE_IDLE &&
+        !s_auto_scan_target_valid && !s_auto_connect_selected_task &&
+        !ble_gap_disc_active() && !ble_gap_conn_active()) {
+        s_conn_metrics.reconnect_attempt_count++;
+        esp_err_t err = ble_central_start_wake_scan();
+        APP_LOGI(TAG, "BLE auto reconnect attempt=%lu started=%s err=%s",
+                 (unsigned long)s_conn_metrics.reconnect_attempt_count,
+                 err == ESP_OK ? "true" : "false", esp_err_to_name(err));
+        /* A real start failure has no future GAP completion to wake us.
+         * Retry it on a deadline, without polling a healthy running scan. */
+        if (err != ESP_OK) return pdMS_TO_TICKS(BLE_AUTO_RECONNECT_RETRY_MS);
+    }
+    return portMAX_DELAY;
+}
+
+/* One permanent worker avoids a lost restart when a disconnect races with
+ * task exit. Signals are latched even if they arrive before the wait. */
 static void ble_auto_reconnect_task(void *arg)
 {
-    uint32_t delay_ms = (uint32_t)(uintptr_t)arg;
-    if (delay_ms > 0) {
-        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    (void)arg;
+    TickType_t wait_ticks = portMAX_DELAY;
+    while (true) {
+        xEventGroupWaitBits(s_reconnect_events, RECONNECT_WAKE, pdTRUE, pdFALSE,
+                            wait_ticks);
+        wait_ticks = auto_reconnect_step();
     }
-
-    uint32_t attempt = 0;
-    while (!s_auto_reconnect_stop && device_config_get_ble_autoconnect()) {
-        if (s_connected || ble_runtime_state() == BLE_STATE_CONNECTED) {
-            break;
-        }
-
-        if (s_host_ready &&
-            ble_runtime_state() == BLE_STATE_IDLE &&
-            !s_auto_scan_target_valid && !s_auto_connect_selected_task &&
-            !ble_gap_disc_active() &&
-            !ble_gap_conn_active()) {
-            attempt++;
-            s_conn_metrics.reconnect_attempt_count++;
-            esp_err_t err = ble_central_start_wake_scan();
-            APP_LOGI(TAG, "BLE auto reconnect attempt=%lu started=%s err=%s",
-                     (unsigned long)attempt,
-                     err == ESP_OK ? "true" : "false",
-                     esp_err_to_name(err));
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(BLE_AUTO_RECONNECT_CHECK_MS));
-    }
-
-    APP_LOGI(TAG, "BLE auto reconnect task stopped state=%s auto=%s",
-             ble_central_state_string(),
-             device_config_get_ble_autoconnect() ? "on" : "off");
-    s_auto_reconnect_task = NULL;
-    vTaskDelete(NULL);
 }
 
 static void schedule_auto_reconnect(const char *reason, uint32_t delay_ms)
 {
-    if (!device_config_get_ble_autoconnect()) {
-        APP_LOGI(TAG, "BLE auto reconnect not scheduled reason=%s auto=off",
-                 reason ? reason : "<none>");
+    if (!device_config_get_ble_autoconnect() || s_auto_reconnect_stop) {
+        wake_reconnect_worker();
         return;
     }
-    if (s_connected || ble_runtime_state() == BLE_STATE_CONNECTED) {
-        return;
+    if (s_connected || ble_runtime_state() == BLE_STATE_CONNECTED) return;
+    portENTER_CRITICAL(&s_reconnect_lock);
+    bool scheduled = !s_auto_reconnect_stop;
+    if (scheduled) {
+        s_reconnect_requested = true;
+        s_reconnect_due_us = esp_timer_get_time() + (int64_t)delay_ms * 1000;
     }
-    if (s_auto_reconnect_task || s_auto_reconnect_stop) {
-        return;
-    }
-
-    BaseType_t created = xTaskCreate(ble_auto_reconnect_task,
-                                     "ble_reconnect",
-                                     4096,
-                                     (void *)(uintptr_t)delay_ms,
-                                     4,
-                                     &s_auto_reconnect_task);
-    if (created != pdPASS) {
-        s_auto_reconnect_task = NULL;
-        APP_LOGE(TAG, "BLE auto reconnect task create failed reason=%s",
-                 reason ? reason : "<none>");
-        return;
-    }
-
+    portEXIT_CRITICAL(&s_reconnect_lock);
+    if (!scheduled) return;
     s_conn_metrics.reconnect_schedule_count++;
+    wake_reconnect_worker();
     APP_LOGI(TAG, "BLE auto reconnect scheduled reason=%s delay_ms=%lu",
-             reason ? reason : "<none>",
-             (unsigned long)delay_ms);
+             reason ? reason : "<none>", (unsigned long)delay_ms);
 }
 
 static void handle_auto_reconnect_after_drop(const char *reason)
@@ -381,6 +396,7 @@ static void ble_auto_connect_selected(void *arg)
     }
 
     s_auto_connect_selected_task = NULL;
+    wake_reconnect_worker();
     vTaskDelete(NULL);
 }
 
@@ -1239,7 +1255,7 @@ static void select_auto_scan_target(const struct ble_gap_disc_desc *disc,
             s_auto_scan_target_valid = false;
             scan_connection_failed();
             ble_runtime_set_state(BLE_STATE_IDLE);
-            schedule_auto_reconnect("selected_task_failed", BLE_AUTO_RECONNECT_CHECK_MS);
+            schedule_auto_reconnect("selected_task_failed", BLE_AUTO_RECONNECT_RETRY_MS);
         }
     }
 }
@@ -2386,6 +2402,9 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISC_COMPLETE:
         {
         bool auto_scan = s_auto_scan_connect;
+        portENTER_CRITICAL(&s_reconnect_lock);
+        bool reconnect_requested = s_reconnect_requested;
+        portEXIT_CRITICAL(&s_reconnect_lock);
         s_conn_metrics.scan_complete_count++;
         s_conn_metrics.last_scan_complete_reason = event->disc_complete.reason;
         APP_LOGI(TAG, "BLE scan complete reason=%d seen=%lu",
@@ -2408,9 +2427,9 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
             if (!s_connected && ble_runtime_state() == BLE_STATE_SCANNING) {
                 ble_runtime_set_state(BLE_STATE_IDLE);
             }
-            if (auto_scan) {
+            if ((auto_scan || reconnect_requested) && !s_auto_connect_selected_task) {
                 schedule_auto_reconnect("scan_complete_no_target",
-                                        BLE_AUTO_RECONNECT_CHECK_MS);
+                                        BLE_AUTO_RECONNECT_RETRY_MS);
             }
         }
         return 0;
@@ -2422,6 +2441,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
             s_connected = true;
             s_conn_handle = event->connect.conn_handle;
             ble_runtime_set_state(BLE_STATE_CONNECTED);
+            wake_reconnect_worker();
             s_fast_live_request_sent = false;
             s_live_parsed_since_connect = 0;
             s_conn_metrics.connect_success_count++;
@@ -2580,6 +2600,12 @@ void ble_central_init(void)
     s_pending_connect_valid = false;
     s_auto_reconnect_task = NULL;
     s_auto_reconnect_stop = false;
+    s_reconnect_requested = false;
+    s_reconnect_events = xEventGroupCreate();
+    ESP_ERROR_CHECK(s_reconnect_events ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(xTaskCreate(ble_auto_reconnect_task, "ble_reconnect", 4096,
+                               NULL, 4, &s_auto_reconnect_task) == pdPASS ?
+                    ESP_OK : ESP_ERR_NO_MEM);
     s_auto_connect_selected_task = NULL;
     s_suppress_next_auto_reconnect = false;
     memset(s_scan_cache, 0, sizeof(s_scan_cache));
@@ -2657,7 +2683,7 @@ static esp_err_t ble_central_connect_addr(const ble_addr_t *target, const char *
         APP_LOGE(TAG, "BLE connect start failed rc=%d", rc);
         scan_connection_failed();
         ble_runtime_set_state(BLE_STATE_IDLE);
-        schedule_auto_reconnect("connect_start_failed", BLE_AUTO_RECONNECT_CHECK_MS);
+        schedule_auto_reconnect("connect_start_failed", BLE_AUTO_RECONNECT_RETRY_MS);
         return ESP_FAIL;
     }
 
@@ -2743,7 +2769,13 @@ static esp_err_t ble_central_start_scan_internal(bool auto_connect,
 
 esp_err_t ble_central_start_scan(void)
 {
-    return ble_central_start_scan_internal(false, NULL, BLE_SCAN_DURATION_MS);
+    esp_err_t err = ble_central_start_scan_internal(false, NULL, BLE_SCAN_DURATION_MS);
+    if (err != ESP_OK) {
+        /* A failed manual scan also needs recovery now that the disconnected
+         * watchdog no longer polls for IDLE. */
+        schedule_auto_reconnect("manual_scan_failed", BLE_AUTO_RECONNECT_RETRY_MS);
+    }
+    return err;
 }
 
 static esp_err_t ble_central_start_wake_scan(void)
@@ -2831,16 +2863,15 @@ void ble_central_disconnect(void)
 {
     ble_central_stop_read_poll_probe();
     s_suppress_next_auto_reconnect = true;
+    xEventGroupClearBits(s_reconnect_events, RECONNECT_STOPPED);
+    portENTER_CRITICAL(&s_reconnect_lock);
     s_auto_reconnect_stop = true;
-    if (s_auto_reconnect_task && s_auto_reconnect_task != xTaskGetCurrentTaskHandle()) {
-        /* Never delete a task that may own the runtime/PM mutex. Let it finish
-         * its current iteration before cancelling scanning below. This wait
-         * is only used by the explicit management disconnect command.
-         */
-        while (s_auto_reconnect_task) {
-            vTaskDelay(pdMS_TO_TICKS(1));
-        }
-    }
+    portEXIT_CRITICAL(&s_reconnect_lock);
+    wake_reconnect_worker();
+    /* Acknowledge after any in-flight scan start finishes, before cancelling
+     * it. The worker never gets deleted while owning an SDK/runtime lock. */
+    xEventGroupWaitBits(s_reconnect_events, RECONNECT_STOPPED, pdTRUE, pdFALSE,
+                        portMAX_DELAY);
     s_auto_scan_connect = false;
     s_auto_scan_target_valid = false;
     s_auto_scan_preferred_valid = false;
@@ -2855,7 +2886,9 @@ void ble_central_disconnect(void)
         (void)ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
     ble_runtime_set_state(BLE_STATE_IDLE);
+    portENTER_CRITICAL(&s_reconnect_lock);
     s_auto_reconnect_stop = false;
+    portEXIT_CRITICAL(&s_reconnect_lock);
     APP_LOGI(TAG, "BLE disconnect requested");
 }
 
@@ -2966,7 +2999,11 @@ void ble_central_get_conn_metrics(ble_central_conn_metrics_t *out_metrics)
     out_metrics->connected = s_connected || ble_runtime_state() == BLE_STATE_CONNECTED;
     out_metrics->scanning = ble_runtime_state() == BLE_STATE_SCANNING || ble_gap_disc_active();
     out_metrics->connecting = ble_runtime_state() == BLE_STATE_CONNECTING || ble_gap_conn_active();
-    out_metrics->reconnect_task_running = s_auto_reconnect_task != NULL;
+    portENTER_CRITICAL(&s_reconnect_lock);
+    out_metrics->reconnect_task_running = s_reconnect_requested;
+    portEXIT_CRITICAL(&s_reconnect_lock);
+    out_metrics->reconnect_task_running &= device_config_get_ble_autoconnect() &&
+        !s_connected && !s_auto_reconnect_stop;
     out_metrics->auto_scan_connect = s_auto_scan_connect;
     out_metrics->fast_param_block_remaining_ms =
         fast_param_block_remaining_ms(esp_timer_get_time());

@@ -14,6 +14,7 @@
 static SemaphoreHandle_t s_lock;
 static EventGroupHandle_t s_events;
 static esp_pm_lock_handle_t s_cpu_lock;
+static esp_pm_lock_handle_t s_awake_lock;
 static ble_state_t s_state = BLE_STATE_IDLE;
 static bool s_cpu_locked;
 #if CONFIG_BT_CTRL_MODEM_SLEEP
@@ -36,6 +37,8 @@ void ble_runtime_init(void)
     ESP_ERROR_CHECK(s_lock && s_events ? ESP_OK : ESP_ERR_NO_MEM);
     ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0,
                                        "ble_link", &s_cpu_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0,
+                                       "ble_link", &s_awake_lock));
 }
 
 void ble_runtime_controller_ready(void)
@@ -66,12 +69,13 @@ void ble_runtime_set_state(ble_state_t state)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     bool active = state == BLE_STATE_CONNECTING || state == BLE_STATE_CONNECTED;
     if (active && !s_cpu_locked) {
+        ESP_ERROR_CHECK(esp_pm_lock_acquire(s_awake_lock));
         ESP_ERROR_CHECK(esp_pm_lock_acquire(s_cpu_lock));
         s_cpu_locked = true;
     }
 #if CONFIG_BT_CTRL_MODEM_SLEEP
     /* Preserve the connected timing behavior: only disconnected scanning uses
-     * modem sleep. CPU light sleep remains disabled independently. */
+     * modem sleep and automatic light sleep. */
     update_modem_sleep(active);
 #endif
     s_state = state;
@@ -82,6 +86,7 @@ void ble_runtime_set_state(ble_state_t state)
     }
     if (!active && s_cpu_locked) {
         ESP_ERROR_CHECK(esp_pm_lock_release(s_cpu_lock));
+        ESP_ERROR_CHECK(esp_pm_lock_release(s_awake_lock));
         s_cpu_locked = false;
     }
     xSemaphoreGive(s_lock);

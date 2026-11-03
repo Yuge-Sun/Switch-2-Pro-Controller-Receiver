@@ -13,7 +13,7 @@ idf_component_register(
         "pro2_rumble_backend.c"
         "v55_control_protocol.c"
     INCLUDE_DIRS "." "tinyusb_config"
-    REQUIRES esp_tinyusb controller nvs_flash esp_timer esp_hw_support esp_pm
+    REQUIRES esp_tinyusb controller nvs_flash esp_timer esp_hw_support esp_pm esp_driver_uart
     WHOLE_ARCHIVE
 )
 

@@ -14,6 +14,9 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_pm.h"
+#include "esp_sleep.h"
+#include "driver/uart.h"
+#include "driver/uart_vfs.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -85,6 +88,9 @@ static usb_source_presence_t s_usb_presence;
 static bool s_usb_driver_installed;
 /* Owned by the input task; held through USB detach even if BLE drops first. */
 static esp_pm_lock_handle_t s_usb_cpu_lock;
+static esp_pm_lock_handle_t s_usb_awake_lock;
+static esp_pm_lock_handle_t s_console_awake_lock;
+static QueueHandle_t s_console_events;
 static bool s_usb_cpu_locked;
 
 #define PRO2_INPUT_STALE_US 200000LL
@@ -425,6 +431,30 @@ void tud_hid_set_report_cb(uint8_t instance,
     }
 }
 
+/* Use the crystal clock so UART baud/wakeup remain valid with DFS and sleep.
+ * Wake characters may be lost by hardware: send Enter, then the command.
+ * A short activity lease keeps partial commands and replies awake. */
+static void control_uart_init(void)
+{
+    const uart_config_t config = {
+        .baud_rate = CONFIG_ESP_CONSOLE_UART_BAUDRATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_XTAL,
+    };
+    const uart_port_t port = CONFIG_ESP_CONSOLE_UART_NUM;
+    ESP_ERROR_CHECK(uart_wait_tx_idle_polling(port));
+    ESP_ERROR_CHECK(uart_param_config(port, &config));
+    ESP_ERROR_CHECK(uart_driver_install(port, 2048, 0, 20, &s_console_events, 0));
+    uart_vfs_dev_use_driver(port);
+    ESP_ERROR_CHECK(uart_set_wakeup_threshold(port, 3));
+    ESP_ERROR_CHECK(esp_sleep_enable_uart_wakeup(port));
+    ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0,
+                                      "console_rx", &s_console_awake_lock));
+}
+
 static void control_task(void *arg)
 {
     (void)arg;
@@ -434,40 +464,66 @@ static void control_task(void *arg)
     bool overflow = false;
     static char reply[16384];
 
+    bool awake = false;
     while (true) {
-        int rx_len = read(STDIN_FILENO, rx, sizeof(rx));
-        if (rx_len <= 0) {
-            vTaskDelay(pdMS_TO_TICKS(20));
+        uart_event_t event;
+        if (xQueueReceive(s_console_events, &event,
+                          awake ? pdMS_TO_TICKS(2000) : portMAX_DELAY) != pdTRUE) {
+            /* No periodic timeout after the lease expires. */
+            ESP_ERROR_CHECK(esp_pm_lock_release(s_console_awake_lock));
+            awake = false;
+            line_len = 0;
+            overflow = false;
             continue;
         }
+        if (!awake) {
+            ESP_ERROR_CHECK(esp_pm_lock_acquire(s_console_awake_lock));
+            awake = true;
+        }
+        if (event.type == UART_WAKEUP || event.type == UART_FIFO_OVF ||
+            event.type == UART_BUFFER_FULL) {
+            line_len = 0;
+            overflow = false;
+            if (event.type != UART_WAKEUP) {
+                ESP_ERROR_CHECK(uart_flush_input(CONFIG_ESP_CONSOLE_UART_NUM));
+            }
+            continue;
+        }
+        if (event.type != UART_DATA) continue;
+        size_t remaining = event.size;
+        while (remaining > 0) {
+            int rx_len = uart_read_bytes(CONFIG_ESP_CONSOLE_UART_NUM, rx,
+                                        remaining < sizeof(rx) ? remaining : sizeof(rx), 0);
+            if (rx_len <= 0) break;
+            remaining -= rx_len;
+            for (int i = 0; i < rx_len; i++) {
+                uint8_t ch = rx[i];
+                if (ch == '\r' || ch == '\n') {
+                    if (overflow) {
+                        ESP_LOGW(TAG, "[V55_CONTROL] line too long; discarded");
+                        printf("{\"ok\":false,\"cmd\":\"serial\",\"error\":\"command line too long\"}\n");
+                        overflow = false;
+                        line_len = 0;
+                        continue;
+                    }
+                    if (line_len > 0) {
+                        line[line_len] = 0;
+                        v55_control_protocol_handle_line(line, reply, sizeof(reply));
+                        line_len = 0;
+                    }
+                    continue;
+                }
 
-        for (int i = 0; i < rx_len; i++) {
-            uint8_t ch = rx[i];
-            if (ch == '\r' || ch == '\n') {
                 if (overflow) {
-                    ESP_LOGW(TAG, "[V55_CONTROL] line too long; discarded");
-                    printf("{\"ok\":false,\"cmd\":\"serial\",\"error\":\"command line too long\"}\n");
-                    overflow = false;
+                    continue;
+                }
+                if (line_len + 1 >= sizeof(line)) {
+                    overflow = true;
                     line_len = 0;
                     continue;
                 }
-                if (line_len > 0) {
-                    line[line_len] = 0;
-                    v55_control_protocol_handle_line(line, reply, sizeof(reply));
-                    line_len = 0;
-                }
-                continue;
+                line[line_len++] = (char)ch;
             }
-
-            if (overflow) {
-                continue;
-            }
-            if (line_len + 1 >= sizeof(line)) {
-                overflow = true;
-                line_len = 0;
-                continue;
-            }
-            line[line_len++] = (char)ch;
         }
     }
 }
@@ -591,6 +647,7 @@ static void detach_source_usb(int64_t now_us)
     s_last_report_us = 0;
     if (s_usb_cpu_locked) {
         ESP_ERROR_CHECK(esp_pm_lock_release(s_usb_cpu_lock));
+        ESP_ERROR_CHECK(esp_pm_lock_release(s_usb_awake_lock));
         s_usb_cpu_locked = false;
     }
 }
@@ -611,6 +668,7 @@ static void update_source_usb(bool connected, bool warmed_up,
     }
 
     /* Discard any late bus events from the previous USB session. */
+    ESP_ERROR_CHECK(esp_pm_lock_acquire(s_usb_awake_lock));
     ESP_ERROR_CHECK(esp_pm_lock_acquire(s_usb_cpu_lock));
     s_usb_cpu_locked = true;
     s_mounted = false;
@@ -901,18 +959,20 @@ static void neutral_report_task(void *arg)
 
 void app_main(void)
 {
-    /* Keep APB at 80 MHz and the radio awake. Only scale the CPUs when idle;
-     * BLE setup/gameplay and attached USB retain the original 240 MHz speed.
-     */
+    /* Sleep automatically between disconnected BLE events. BLE setup/gameplay
+     * and attached USB hold explicit awake/full-speed locks. */
     const esp_pm_config_t power_config = {
         .max_freq_mhz = 240,
         .min_freq_mhz = 80,
-        .light_sleep_enable = false,
+        .light_sleep_enable = true,
     };
     ESP_ERROR_CHECK(esp_pm_configure(&power_config));
     ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0,
                                        "ds5_usb", &s_usb_cpu_lock));
-    ESP_LOGI(TAG, "[POWER] cpu_min_mhz=80 cpu_max_mhz=240 light_sleep=false");
+    ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0,
+                                       "ds5_usb", &s_usb_awake_lock));
+    control_uart_init();
+    ESP_LOGI(TAG, "[POWER] cpu_min_mhz=80 cpu_max_mhz=240 light_sleep=true");
     ESP_LOGI(TAG, "[DS5_IDENTITY] enabled=true mode=dualsense_experimental profile=%s",
              DS5_PROFILE_NAME);
     ESP_LOGI(TAG,

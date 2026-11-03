@@ -20,11 +20,11 @@ static const char *TAG = "v5.5_pro2";
 static void reconnect_watchdog_task(void *arg)
 {
     (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    uint32_t attempt = 0;
     int64_t last_stale_recovery_us = 0;
     while (true) {
+        /* Scan management owns disconnected recovery. This watchdog only
+         * needs a clock while a controller link exists. */
+        ble_central_wait_connected();
         const char *state = ble_central_state_string();
         if (strcmp(state, "connected") == 0) {
             ble_central_conn_metrics_t metrics;
@@ -66,15 +66,6 @@ static void reconnect_watchdog_task(void *arg)
                          esp_err_to_name(err));
             }
         }
-        if (strcmp(state, "idle") == 0) {
-            attempt++;
-            /* One worker owns automatic scanning, including before the first
-             * connection. Watchdog checks never reset its fast-scan deadline. */
-            ble_central_start_auto_reconnect();
-            ESP_LOGI(TAG, "[PRO2_INPUT] wake_reconnect_wait attempt=%lu",
-                     (unsigned long)attempt);
-        }
-
         vTaskDelay(pdMS_TO_TICKS(1500));
     }
 }
