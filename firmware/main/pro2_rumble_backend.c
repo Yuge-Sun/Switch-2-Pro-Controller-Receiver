@@ -430,6 +430,9 @@ bool pro2_rumble_backend_handle_dualsense_output(
     const uint8_t *buffer,
     uint16_t len)
 {
+    // Runs in the TinyUSB output callback. Keep UART logging out of this
+    // handler so feedback changes cannot stall USB input processing.
+    // Diagnostics remain available through pro2_rumble_backend_snapshot().
     if (!buffer || len == 0 ||
         (report_id != 0 && report_id != DS5_OUTPUT_REPORT_ID)) {
         return false;
@@ -446,29 +449,16 @@ bool pro2_rumble_backend_handle_dualsense_output(
     }
     dualsense_rumble_intent_t intent;
     if (!dualsense_rumble_intent_parse(payload, payload_len, &intent)) {
-        ESP_LOGW(TAG,
-                 "[DS5_RUMBLE] handled=false error=short_payload len=%u",
-                 (unsigned)payload_len);
         return false;
     }
 
     bool nonzero =
         intent.right_light != 0 || intent.left_heavy != 0;
-    bool changed;
-    uint32_t updates;
     int64_t now_us = esp_timer_get_time();
     uint8_t preview_len = payload_len < PRO2_RUMBLE_OUTPUT_PREVIEW_BYTES ?
         (uint8_t)payload_len : PRO2_RUMBLE_OUTPUT_PREVIEW_BYTES;
-    uint8_t log_preview[8] = {0};
-    uint8_t log_preview_len = payload_len < sizeof(log_preview) ? (uint8_t)payload_len : sizeof(log_preview);
-    memcpy(log_preview, payload, log_preview_len);
 
     portENTER_CRITICAL(&s_lock);
-    changed = intent.right_light != s_last_right ||
-              intent.left_heavy != s_last_left ||
-              intent.compatibility_selected !=
-                  s_last_compatibility_selected ||
-              intent.ordinary_active != s_arbiter.ordinary_active;
     s_last_right = intent.right_light;
     s_last_left = intent.left_heavy;
     s_last_compatibility_selected =
@@ -486,7 +476,6 @@ bool pro2_rumble_backend_handle_dualsense_output(
     memset(s_last_preview, 0, sizeof(s_last_preview));
     memcpy(s_last_preview, payload, preview_len);
     s_updates++;
-    updates = s_updates;
     pro2_rumble_arbiter_set_host_mode(
         &s_arbiter,
         intent.compatibility_selected
@@ -524,26 +513,6 @@ bool pro2_rumble_backend_handle_dualsense_output(
     }
     portEXIT_CRITICAL(&s_lock);
 
-    if (changed || updates == 1) {
-        ESP_LOGI(TAG,
-                 "[DS5_RUMBLE] handled=true host_mode=%s compatibility=%s v1=%s v2=%s ordinary_valid=%s active=%s flags=%02x/%02x/%02x right_light=%u left_heavy=%u updates=%lu data=%02x%02x%02x%02x%02x%02x%02x%02x",
-                 intent.compatibility_selected
-                     ? "compatibility"
-                     : "audio_haptics",
-                 intent.compatibility_selected ? "true" : "false",
-                 intent.compatibility_v1 ? "true" : "false",
-                 intent.compatibility_v2 ? "true" : "false",
-                 intent.ordinary_valid ? "true" : "false",
-                 intent.ordinary_active ? "true" : "false",
-                 intent.valid_flag0,
-                 intent.valid_flag1,
-                 intent.valid_flag2,
-                 intent.right_light,
-                 intent.left_heavy,
-                 (unsigned long)updates,
-                 log_preview[0], log_preview[1], log_preview[2], log_preview[3],
-                 log_preview[4], log_preview[5], log_preview[6], log_preview[7]);
-    }
     return true;
 }
 
