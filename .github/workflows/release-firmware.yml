@@ -13,27 +13,40 @@ permissions:
 
 jobs:
   build:
+    name: Build ${{ matrix.board }} firmware
     runs-on: ubuntu-latest
     container: espressif/idf:v5.4.2
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - board: DevKitC-1 N16R8
+            artifact: esp32s3-receiver
+            defaults: sdkconfig.defaults
+          - board: Mini ESP32-S3FH4R2
+            artifact: esp32s3-mini-receiver
+            defaults: sdkconfig.defaults;sdkconfig.defaults.mini
     steps:
       - uses: actions/checkout@v4
-      - name: Build PS5 receiver for ESP32-S3 with 16 MB flash
+      - name: Build and merge the receiver image
         working-directory: firmware
         shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          SDK_DEFAULTS: ${{ matrix.defaults }}
         run: |
           set -eo pipefail
           . "$IDF_PATH/export.sh"
-          idf.py set-target esp32s3
-          idf.py build
+          idf.py -D "SDKCONFIG_DEFAULTS=$SDK_DEFAULTS" build
           mkdir -p dist
           cd build
-          python -m esptool --chip esp32s3 merge_bin -o ../dist/esp32s3-receiver.bin @flash_args
+          python -m esptool --chip esp32s3 merge_bin -o "../dist/$ARTIFACT.bin" @flash_args
           cd ../dist
-          sha256sum esp32s3-receiver.bin > SHA256SUMS.txt
+          sha256sum "$ARTIFACT.bin" > SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: esp32s3-receiver
+          name: ${{ matrix.artifact }}
           path: |
-            firmware/dist/esp32s3-receiver.bin
+            firmware/dist/${{ matrix.artifact }}.bin
             firmware/dist/SHA256SUMS.txt
           if-no-files-found: error

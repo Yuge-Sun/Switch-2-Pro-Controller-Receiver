@@ -1,0 +1,9 @@
+# ESP32-S3FH4R2 with 4 MB flash and 2 MB quad-SPI PSRAM.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_SPEED_40M=y
+# Keep regular allocations in internal RAM, as in the DevKitC build.
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y
+# TinyUSB uses the native USB PHY for the DualSense interfaces.
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y

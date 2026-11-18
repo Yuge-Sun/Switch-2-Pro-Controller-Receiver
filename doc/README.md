@@ -9,11 +9,12 @@ Feature to be added in the future: ability to remap the C button and GR/GL back 
 ## What you need
 
 - A Nintendo Switch 2 Pro Controller.
-- An ESP32-S3 DevKitC-1 **N16R8** board (16 MB flash, 8 MB PSRAM).
+- An ESP32-S3 DevKitC-1 **N16R8** board (16 MB flash, 8 MB PSRAM). **(Recommended)**
+- **Or alternatively** an ESP32-S3 Zero / Mini (ESP32-S3FH4R2, 4 MB flash, 2 MB PSRAM). For the Zero / Mini, use the [Mini firmware and flashing guide](esp32-s3-mini.md) instead.
 - A USB cable that supports data transfer.
 - A Windows PC with Google Chrome or Microsoft Edge (Firefox not supported).
 
-The board has two USB ports. Use the **COM/UART** port to install the firmware and the **USB/OTG** port for gameplay.
+The N16R8 board has two USB ports. Use the **COM/UART** port to install the firmware and the **USB/OTG** port for gameplay.
 
 | Board port | Use it for |
 | --- | --- |
@@ -26,7 +27,7 @@ The board has two USB ports. Use the **COM/UART** port to install the firmware a
 
 Open this project's [Releases page](https://github.com/Yuge-Sun/Switch-2-Pro-Controller-Receiver/releases). Under the latest firmware release's **Assets**, download **`esp32s3-receiver.bin`**. This single file contains everything needed to flash the receiver. The **Source code** ZIP files are for developers.
 
-If a release is not available, open the project's **Actions** tab, select a successful **Build release firmware** run, and download the **esp32s3-receiver** artifact at the bottom. Extract the ZIP to find the `.bin` file. GitHub requires you to sign in to download Actions artifacts.
+If a release is not available, open the project's **Actions** tab, select a successful run, and download the **esp32s3-receiver** artifact at the bottom. Extract the ZIP to find the `.bin` file. GitHub requires you to sign in to download Actions artifacts.
 
 ## 2. Install the firmware
 
@@ -40,7 +41,6 @@ You can do this directly in your browser:
 6. Click **Program** and wait for it to finish. Keep the cable connected while it writes the firmware.
 7. Click **Disconnect**, then unplug the board.
 
-Installing this firmware clears the receiver's saved pairing and settings. Pair the controller again after each firmware update.
 
 ## 3. Pair and play
 
@@ -58,7 +58,7 @@ Installing this firmware clears the receiver's saved pairing and settings. Pair 
 
    Audio-driven haptic feedback/HD rumble requires a game that supports DualSense haptics.
 
-For everyday use, leave the receiver connected through its USB/OTG port and wake the controller with a button press. It reconnects automatically. After 10 minutes without input, the receiver disconnects the controller; press a button to resume. 
+For everyday use, leave the receiver connected through its USB/OTG port and wake the controller with a button press. It reconnects automatically. After 10 minutes without input, the receiver disconnects the controller; press a button on your controller to resume. 
 
 ## If something goes wrong
 
